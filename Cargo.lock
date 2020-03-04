@@ -120,7 +120,7 @@ version = "0.1.0"
 dependencies = [
  "kvm-bindings",
  "kvm-ioctls",
- "vmm-sys-util 0.2.1",
+ "vmm-sys-util",
 ]
 
 [[package]]
@@ -135,6 +135,7 @@ version = "0.1.0"
 dependencies = [
  "byteorder",
  "dumbo",
+ "io-uring",
  "libc",
  "logger",
  "memory_model",
@@ -143,7 +144,7 @@ dependencies = [
  "rate_limiter",
  "utils",
  "virtio_gen",
- "vmm-sys-util 0.4.0",
+ "vmm-sys-util",
 ]
 
 [[package]]
@@ -199,6 +200,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "io-uring"
+version = "0.3.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3822a27c48994cea60ca6b7aa808c9b7c1e930787383b5ebe8292e10314608d0"
+dependencies = [
+ "bitflags",
+ "libc",
+]
+
+[[package]]
 name = "itoa"
 version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -229,7 +240,7 @@ version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d381156ad52005b4655a9421401f02b80f9f049e653496e3ea6639a83fc12453"
 dependencies = [
- "vmm-sys-util 0.2.1",
+ "vmm-sys-util",
 ]
 
 [[package]]
@@ -240,7 +251,7 @@ checksum = "ac8a59db3c7098cc87f140eb7a4317decda01dd42e7979b1d4d789bd6f6c599a"
 dependencies = [
  "kvm-bindings",
  "libc",
- "vmm-sys-util 0.2.1",
+ "vmm-sys-util",
 ]
 
 [[package]]
@@ -550,7 +561,7 @@ dependencies = [
  "net_gen",
  "serde",
  "serde_json",
- "vmm-sys-util 0.2.1",
+ "vmm-sys-util",
 ]
 
 [[package]]
@@ -580,16 +591,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "utils",
- "vmm-sys-util 0.2.1",
-]
-
-[[package]]
-name = "vmm-sys-util"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6ebb6ba7ba5653b69bfd3fab8c8c363945c0d3f616a6a1592e12122c3be4724e"
-dependencies = [
- "libc",
+ "vmm-sys-util",
 ]
 
 [[package]]

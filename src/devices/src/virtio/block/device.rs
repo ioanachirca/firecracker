@@ -20,6 +20,11 @@ use rate_limiter::{RateLimiter, TokenType};
 use utils::eventfd::EventFd;
 use virtio_gen::virtio_blk::*;
 
+use io_uring;
+use memory_model::GuestAddress;
+
+use std::os::unix::io::AsRawFd;
+
 use super::{
     super::{ActivateResult, Queue, VirtioDevice, TYPE_BLOCK, VIRTIO_MMIO_INT_VRING},
     request::*,
@@ -96,6 +101,11 @@ pub struct Block {
 
     // Implementation specific fields.
     pub(crate) rate_limiter: RateLimiter,
+
+    // IoUring related fields.
+    pub(crate) ring: io_uring::IoUring,
+    pub(crate) completion_evt: EventFd,
+    pub(crate) in_flight: u32,
 }
 
 impl Block {
@@ -127,6 +137,12 @@ impl Block {
 
         let queues = QUEUE_SIZES.iter().map(|&s| Queue::new(s)).collect();
 
+        let ring = io_uring::IoUring::new(128).unwrap();
+        let completion_evt = EventFd::new(libc::EFD_NONBLOCK)?;
+
+        // Register the completion_evt in order to get notified of IoUring completions.
+        ring.register(io_uring::reg::Target::EventFd(completion_evt.as_raw_fd())).unwrap();
+
         Ok(Block {
             disk_image_id: build_disk_image_id(&disk_image),
             disk_image,
@@ -141,6 +157,9 @@ impl Block {
             queue_evt,
             queues,
             device_activated: false,
+            ring: ring,
+            completion_evt: completion_evt,
+            in_flight: 0,
         })
     }
 
@@ -196,40 +215,105 @@ impl Block {
                             break;
                         }
                     }
-                    let status = match request.execute(
-                        &mut self.disk_image,
+
+                    // Wait for completions if the submission queue is full.
+                    if self.in_flight == self.ring.params().cq_entries() {
+                        println!("submission queue is full, wait for more completions");
+                        queue.undo_pop();
+                        // will this trigger an event?
+                        self.ring.submit_and_wait(self.in_flight as usize).unwrap();
+                        break;
+                    }
+
+                    match request.execute(&mut self.disk_image,
                         self.disk_nsectors,
                         &self.mem,
                         &self.disk_image_id,
+                        &mut self.ring,
+                        head.index,
                     ) {
                         Ok(l) => {
                             len = l;
-                            VIRTIO_BLK_S_OK
+                            if request.request_type != RequestType::In
+                                && request.request_type != RequestType::Out
+                            {
+                                self.mem
+                                    .write_obj_at_addr(VIRTIO_BLK_S_OK, request.status_addr)
+                                    .unwrap();
+
+                                queue.add_used(&self.mem, head.index, len);
+                            } else {
+                                self.in_flight += 1;
+                            }
                         }
                         Err(e) => {
                             error!("Failed to execute request: {:?}", e);
                             METRICS.block.invalid_reqs_count.inc();
                             len = 1; // We need at least 1 byte for the status.
-                            e.status()
+
+                            self.mem
+                                .write_obj_at_addr(e.status(), request.status_addr)
+                                .unwrap();
+
+                            queue.add_used(&self.mem, head.index, len);
                         }
+                        
                     };
-                    // We use unwrap because the request parsing process already checked that the
-                    // status_addr was valid.
-                    self.mem
-                        .write_obj_at_addr(status, request.status_addr)
-                        .unwrap();
                 }
                 Err(e) => {
                     error!("Failed to parse available descriptor chain: {:?}", e);
                     METRICS.block.execute_fails.inc();
                     len = 0;
+
+                    queue.add_used(&self.mem, head.index, len);
                 }
-            }
-            queue.add_used(&self.mem, head.index, len);
+            };
             used_any = true;
         }
-
         used_any
+    }
+
+    pub(crate) fn process_completion_event(&mut self) {
+        if let Err(e) = self.completion_evt.read() {
+            error!("Failed to get completion event: {:?}", e);
+            return;
+        }
+
+        let cqes = self.ring.completion().available().collect::<Vec<_>>();
+        if cqes.len() == 0 {
+            //println!("Completed: {}", cqes.len());
+            return;
+        }
+
+        let queue = &mut self.queues[0];
+
+        for cqe in cqes.iter() {
+            let data: std::boxed::Box<IoUringData> = unsafe {Box::from_raw(cqe.user_data() as *mut _)};
+            let data = *data;
+            let status;
+            let len;
+            if cqe.result() >= 0 {
+                status = VIRTIO_BLK_S_OK;
+                len = data.len;
+            } else {
+                println!("Type: {:?}, error: {}, len: {}", data.is_read, cqe.result(), data.len);
+                status = VIRTIO_BLK_S_IOERR;
+                len = 1;
+            }
+
+            self.mem
+                .write_obj_at_addr(status, GuestAddress(data.addr))
+                .unwrap();
+
+            queue.add_used(&self.mem, data.head_index, len);
+        }
+
+        self.in_flight -= cqes.len() as u32;
+        // Okay to signal because we processed some requests from the virtio queue.
+        if self.in_flight == 0 {
+            let _ = self.signal_used_queue();
+        }
+        
     }
 
     pub(crate) fn signal_used_queue(&self) -> result::Result<(), DeviceError> {
@@ -649,6 +733,10 @@ mod tests {
                 VIRTIO_BLK_S_OK
             );
         }
+
+        // Simulate another request happened meanwhile.
+        mem.write_obj_at_addr::<u64>(666_666_666, data_addr)
+            .unwrap();
 
         // Read.
         {

@@ -239,6 +239,17 @@ impl MemoryMapping {
         Ok(())
     }
 
+    pub fn get_slice(&self, mem_offset: usize, count: usize) -> Result<&mut [u8]> {
+        let (mem_end, fail) = mem_offset.overflowing_add(count);
+        if fail || mem_end > self.size() {
+            return Err(Error::InvalidRange(mem_offset, count));
+        }
+
+        let dst = unsafe { &mut self.as_mut_slice()[mem_offset..mem_end] };
+
+        Ok(dst)
+    }
+
     /// Writes data from memory to a writable object.
     ///
     /// # Arguments

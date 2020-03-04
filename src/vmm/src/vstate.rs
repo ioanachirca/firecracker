@@ -109,6 +109,14 @@ pub enum Error {
     VcpuArmInit(kvm_ioctls::Error),
 }
 
+extern "C" {
+    fn __libc_current_sigrtmin() -> c_int;
+}
+
+pub fn sigrtmin() -> c_int {
+    unsafe { __libc_current_sigrtmin() }
+}
+
 impl Display for Error {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         use self::Error::*;
@@ -447,16 +455,8 @@ impl Vcpu {
                 });
             }
         }
-        unsafe {
-            // This uses an async signal safe handler to kill the vcpu handles.
-            register_signal_handler(
-                VCPU_RTSIG_OFFSET,
-                SignalHandler::Siginfo(handle_signal),
-                true,
-                libc::SA_SIGINFO,
-            )
+        register_signal_handler(sigrtmin() + VCPU_RTSIG_OFFSET, handle_signal)
             .expect("Failed to register vcpu signal handler");
-        }
     }
 
     /// Constructs a new VCPU for `vm`.
@@ -1009,7 +1009,7 @@ mod tests {
         barrier.wait();
         // Kick the Vcpu using the custom signal.
         handle
-            .kill(VCPU_RTSIG_OFFSET)
+            .kill(sigrtmin() + VCPU_RTSIG_OFFSET)
             .expect("failed to signal thread");
         handle.join().expect("failed to join thread");
         // Verify that the Vcpu saw its kvm immediate-exit as set.

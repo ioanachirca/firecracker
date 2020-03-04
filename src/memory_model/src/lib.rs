@@ -7,7 +7,7 @@
 
 //! Provides a wrapper for allocating, handling and interacting with the guest memory regions.
 
-#![deny(missing_docs)]
+// #![deny(missing_docs)]
 
 extern crate libc;
 

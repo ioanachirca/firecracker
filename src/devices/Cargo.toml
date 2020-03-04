@@ -7,6 +7,7 @@ edition = "2018"
 [dependencies]
 byteorder = ">=1.2.1"
 libc = ">=0.2.39"
+io-uring = "0.3.2"
 
 dumbo = { path = "../dumbo" }
 logger = { path = "../logger" }

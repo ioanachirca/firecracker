@@ -6,8 +6,10 @@
 // found in the THIRD-PARTY file.
 
 use std::convert::From;
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, Write};
 use std::result;
+
+use std::os::unix::io::{AsRawFd, RawFd};
 
 use logger::{Metric, METRICS};
 use memory_model::{DataInit, GuestAddress, GuestMemory, GuestMemoryError};
@@ -15,6 +17,8 @@ use virtio_gen::virtio_blk::*;
 
 use super::super::DescriptorChain;
 use super::{Error, SECTOR_SHIFT, SECTOR_SIZE};
+
+use io_uring;
 
 #[derive(Debug)]
 pub enum ExecuteError {
@@ -64,8 +68,16 @@ pub struct Request {
     pub request_type: RequestType,
     pub data_len: u32,
     pub status_addr: GuestAddress,
-    sector: u64,
-    data_addr: GuestAddress,
+    pub sector: u64,
+    pub data_addr: GuestAddress,
+}
+
+pub struct IoUringData<'a> {
+    pub is_read: bool, // type of request
+    buf: [io::IoSlice<'a>; 1], // memory it refers to
+    pub addr: u64, // request status address
+    pub head_index: u16, // virtio queue index of request
+    pub len: u32, // len of request
 }
 
 /// The request header represents the mandatory fields of each block device request.
@@ -177,12 +189,56 @@ impl Request {
         Ok(req)
     }
 
-    pub fn execute<T: Seek + Read + Write>(
+    fn queue_request(&self, ring: &mut io_uring::IoUring, mem: &GuestMemory, fd: RawFd, is_read: bool, index: u16) {
+        let mem_slice = mem
+            .get_memory_slice(self.data_addr, self.data_len as usize)
+            .unwrap();
+        
+        let buf = [io::IoSlice::new(mem_slice)];
+
+        let data = IoUringData {
+            is_read: true,
+            buf: buf,
+            addr: self.status_addr.0,
+            head_index: index,
+            len: self.data_len,
+        };
+
+        let boxed_data = Box::new(data);
+        let target = io_uring::opcode::types::Target::Fd(fd);
+
+        let sqe = if is_read {
+            io_uring::opcode::Readv::new(target, (*boxed_data).buf.as_ptr() as *mut _, 1)
+                .offset((self.sector << SECTOR_SHIFT) as i64).build()
+        } else {
+            io_uring::opcode::Writev::new(target, (*boxed_data).buf.as_ptr() as *const _, 1)
+                .offset((self.sector << SECTOR_SHIFT) as i64).build()
+        };
+
+        let boxed_data_ptr = Box::into_raw(boxed_data) as u64;
+
+        unsafe {
+            let mut queue = ring.submission().available();
+            queue
+                .push(
+                    sqe.user_data(boxed_data_ptr)
+                )
+                .ok()
+                .expect("io_uring queue is full");
+            queue.sync();
+        }
+
+        ring.submit().unwrap();
+    }
+
+    pub fn execute<T: Seek + Read + Write + AsRawFd>(
         &self,
         disk: &mut T,
         disk_nsectors: u64,
         mem: &GuestMemory,
         disk_id: &[u8],
+        ring: &mut io_uring::IoUring,
+        head_index: u16,
     ) -> result::Result<u32, ExecuteError> {
         let mut top: u64 = u64::from(self.data_len) / SECTOR_SIZE;
         if u64::from(self.data_len) % SECTOR_SIZE != 0 {
@@ -195,20 +251,17 @@ impl Request {
             return Err(ExecuteError::BadRequest(Error::InvalidOffset));
         }
 
-        disk.seek(SeekFrom::Start(self.sector << SECTOR_SHIFT))
-            .map_err(ExecuteError::Seek)?;
-
         match self.request_type {
             RequestType::In => {
-                mem.read_to_memory(self.data_addr, disk, self.data_len as usize)
-                    .map_err(ExecuteError::Read)?;
+                self.queue_request(ring, mem, disk.as_raw_fd(), true, head_index);
+
                 METRICS.block.read_bytes.add(self.data_len as usize);
                 METRICS.block.read_count.inc();
                 return Ok(self.data_len);
             }
             RequestType::Out => {
-                mem.write_from_memory(self.data_addr, disk, self.data_len as usize)
-                    .map_err(ExecuteError::Write)?;
+                self.queue_request(ring, mem, disk.as_raw_fd(), false, head_index);
+
                 METRICS.block.write_bytes.add(self.data_len as usize);
                 METRICS.block.write_count.inc();
             }

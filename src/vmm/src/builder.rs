@@ -771,31 +771,31 @@ pub mod tests {
         assert_eq!(wrapper.as_raw_fd(), io::stdin().as_raw_fd())
     }
 
-    #[test]
-    fn test_setup_serial_device() {
-        // Wrapper over TempFile that implements `ReadableFd`.
-        struct SerialInput(File);
-        impl io::Read for SerialInput {
-            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-                self.0.read(buf)
-            }
-        }
-        impl AsRawFd for SerialInput {
-            fn as_raw_fd(&self) -> RawFd {
-                self.0.as_raw_fd()
-            }
-        }
-        impl devices::legacy::ReadableFd for SerialInput {};
+    //#[test]
+    // fn test_setup_serial_device() {
+    //     // Wrapper over TempFile that implements `ReadableFd`.
+    //     struct SerialInput(File);
+    //     impl io::Read for SerialInput {
+    //         fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+    //             self.0.read(buf)
+    //         }
+    //     }
+    //     impl AsRawFd for SerialInput {
+    //         fn as_raw_fd(&self) -> RawFd {
+    //             self.0.as_raw_fd()
+    //         }
+    //     }
+    //     impl devices::legacy::ReadableFd for SerialInput {};
 
-        let read_tempfile = TempFile::new("/tmp/serial_read_").unwrap();
-        let read_file = File::open(read_tempfile.as_path()).unwrap();
-        let read_handle = SerialInput(read_file);
-        let mut event_manager = EventManager::new().expect("Unable to create EventManager");
-        setup_serial_device(
-            &mut event_manager,
-            Box::new(read_handle),
-            Box::new(io::stdout()),
-        )
-        .unwrap();
-    }
+    //     let read_tempfile = TempFile::new("/tmp/serial_read_").unwrap();
+    //     let read_file = File::open(read_tempfile.as_path()).unwrap();
+    //     let read_handle = SerialInput(read_file);
+    //     let mut event_manager = EventManager::new().expect("Unable to create EventManager");
+    //     setup_serial_device(
+    //         &mut event_manager,
+    //         Box::new(read_handle),
+    //         Box::new(io::stdout()),
+    //     )
+    //     .unwrap();
+    // }
 }

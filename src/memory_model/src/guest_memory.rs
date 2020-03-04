@@ -331,6 +331,23 @@ impl GuestMemory {
         })
     }
 
+    pub fn get_memory_slice(&self, guest_addr: GuestAddress, size: usize) -> Result<&mut [u8]> {
+        for region in self.regions.iter() {
+            if guest_addr >= region.guest_base && guest_addr < region_end(region) {
+                let offset = guest_addr.unchecked_offset_from(region.guest_base) as usize;
+                if size <= region.mapping.size() - offset {
+                    // we're good to go!
+                    return region
+                        .mapping
+                        .get_slice(offset, size)
+                        .map_err(|e| Error::MemoryAccess(guest_addr, e));
+                }
+                break;
+            }
+        }
+        Err(Error::InvalidGuestAddressRange(guest_addr, size))
+    }
+
     /// Writes data from memory to a writable object.
     ///
     /// # Arguments
