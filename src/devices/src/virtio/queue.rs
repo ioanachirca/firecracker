@@ -344,6 +344,17 @@ impl Queue {
             .unwrap();
     }
 
+    /// Get next avail desc index value from the avail ring.
+    pub fn get_next_avail(&mut self, mem: &GuestMemory) -> Option<u16> {
+        let index_offset = 4 + 2 * (self.next_avail.0 % self.actual_size());
+
+        let desc_index: u16 = mem
+            .read_obj_from_addr(self.avail_ring.unchecked_add(u64::from(index_offset)))
+            .unwrap();
+
+        return Some(desc_index);
+    }
+
     /// Goes back one position in the available descriptor chain offered by the driver.
     /// Rust does not support bidirectional iterators. This is the only way to revert the effect
     /// of an iterator increment on the queue.

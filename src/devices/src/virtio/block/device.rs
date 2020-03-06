@@ -22,6 +22,8 @@ use virtio_gen::virtio_blk::*;
 
 use io_uring;
 use memory_model::GuestAddress;
+use std::time::Duration;
+use timerfd::{ClockId, SetTimeFlags, TimerFd, TimerState};
 
 use std::os::unix::io::AsRawFd;
 
@@ -32,6 +34,8 @@ use super::{
 };
 
 use crate::Error as DeviceError;
+
+const COALESCE_TIMEOUT: u64 = 5;
 
 pub fn build_config_space(disk_size: u64) -> Vec<u8> {
     // We only support disk size, which uses the first two words of the configuration space.
@@ -106,6 +110,12 @@ pub struct Block {
     pub(crate) ring: io_uring::IoUring,
     pub(crate) completion_evt: EventFd,
     pub(crate) in_flight: u32,
+
+    // Interrupt coalesce related fields.
+    pub(crate) coalesce_threshold: u32,
+    pub(crate) coalesce: u32,
+    pub(crate) coalesce_timer: TimerFd,
+    pub(crate) coalesce_timer_armed: bool,
 }
 
 impl Block {
@@ -141,7 +151,11 @@ impl Block {
         let completion_evt = EventFd::new(libc::EFD_NONBLOCK)?;
 
         // Register the completion_evt in order to get notified of IoUring completions.
-        ring.register(io_uring::reg::Target::EventFd(completion_evt.as_raw_fd())).unwrap();
+        ring.register(io_uring::reg::Target::EventFd(completion_evt.as_raw_fd()))
+            .unwrap();
+
+        // Create TimerFd for interrupt coalescing: non-blocking, close-on-exec.
+        let coalesce_timer = TimerFd::new_custom(ClockId::Monotonic, true, true).unwrap();
 
         Ok(Block {
             disk_image_id: build_disk_image_id(&disk_image),
@@ -160,7 +174,18 @@ impl Block {
             ring: ring,
             completion_evt: completion_evt,
             in_flight: 0,
+            coalesce_threshold: 8,
+            coalesce: 0,
+            coalesce_timer: coalesce_timer,
+            coalesce_timer_armed: false,
         })
+    }
+
+    pub(crate) fn restart_coalesce_timer(&mut self) {
+        let timer_state = TimerState::Oneshot(Duration::from_millis(COALESCE_TIMEOUT));
+        self.coalesce_timer
+            .set_state(timer_state, SetTimeFlags::Default);
+        self.coalesce_timer_armed = true;
     }
 
     pub(crate) fn process_queue_event(&mut self) {
@@ -169,7 +194,17 @@ impl Block {
             error!("Failed to get queue event: {:?}", e);
             METRICS.block.event_fails.inc();
         } else if !self.rate_limiter.is_blocked() && self.process_queue(0) {
-            let _ = self.signal_used_queue();
+            if self.coalesce > self.coalesce_threshold {
+                //println!("passed threshold");
+                self.coalesce = 0;
+                self.coalesce_timer_armed = false;
+                self.coalesce_timer.set_state(TimerState::Disarmed, SetTimeFlags::Default);
+                let _ = self.signal_used_queue();
+            }
+            // This catches the case in which there is a FLUSH/GET_DEVICE_ID request.
+            else if self.coalesce > 0 && !self.coalesce_timer_armed {
+                self.restart_coalesce_timer();
+            }
         }
     }
 
@@ -178,13 +213,27 @@ impl Block {
         // Upon rate limiter event, call the rate limiter handler
         // and restart processing the queue.
         if self.rate_limiter.event_handler().is_ok() && self.process_queue(0) {
-            let _ = self.signal_used_queue();
+            if self.coalesce > 8 {
+                self.coalesce = 0;
+                let _ = self.signal_used_queue();
+            }
         }
     }
 
     pub(crate) fn process_queue(&mut self, queue_index: usize) -> bool {
+        //println!("queue event");
         let queue = &mut self.queues[queue_index];
         let mut used_any = false;
+        let mut bs_count = 0;
+        let mut bs_sum = 0;
+
+        // if let Some(first_head) = queue.pop(&self.mem) {
+        //     println!("first_head: {}", first_head.index);
+        //     queue.undo_pop();
+        // }
+        
+        
+
         while let Some(head) = queue.pop(&self.mem) {
             let len;
             match Request::parse(&head, &self.mem) {
@@ -220,12 +269,16 @@ impl Block {
                     if self.in_flight == self.ring.params().cq_entries() {
                         println!("submission queue is full, wait for more completions");
                         queue.undo_pop();
-                        // will this trigger an event?
+                        // TODO: will this trigger an event?
                         self.ring.submit_and_wait(self.in_flight as usize).unwrap();
                         break;
                     }
 
-                    match request.execute(&mut self.disk_image,
+                    bs_sum += request.data_len;
+                    bs_count += 1;
+
+                    match request.execute(
+                        &mut self.disk_image,
                         self.disk_nsectors,
                         &self.mem,
                         &self.disk_image_id,
@@ -242,6 +295,8 @@ impl Block {
                                     .unwrap();
 
                                 queue.add_used(&self.mem, head.index, len);
+                                self.coalesce += 1;
+                                used_any = true;
                             } else {
                                 self.in_flight += 1;
                             }
@@ -256,8 +311,9 @@ impl Block {
                                 .unwrap();
 
                             queue.add_used(&self.mem, head.index, len);
+                            self.coalesce += 1;
+                            used_any = true;
                         }
-                        
                     };
                 }
                 Err(e) => {
@@ -266,29 +322,33 @@ impl Block {
                     len = 0;
 
                     queue.add_used(&self.mem, head.index, len);
+                    self.coalesce += 1;
+                    used_any = true;
                 }
             };
-            used_any = true;
+            //used_any = true;
         }
+
+        // if bs_count > 0 {
+        //     self.compute_coalesce_threshold(bs_sum / bs_count);
+        // }
+        //println!("next_avail: {}", queue.get_next_avail(&self.mem).unwrap());
         used_any
     }
 
     pub(crate) fn process_completion_event(&mut self) {
+        //println!("completion event");
         if let Err(e) = self.completion_evt.read() {
             error!("Failed to get completion event: {:?}", e);
             return;
         }
 
         let cqes = self.ring.completion().available().collect::<Vec<_>>();
-        if cqes.len() == 0 {
-            //println!("Completed: {}", cqes.len());
-            return;
-        }
-
         let queue = &mut self.queues[0];
 
         for cqe in cqes.iter() {
-            let data: std::boxed::Box<IoUringData> = unsafe {Box::from_raw(cqe.user_data() as *mut _)};
+            let data: std::boxed::Box<IoUringData> =
+                unsafe { Box::from_raw(cqe.user_data() as *mut _) };
             let data = *data;
             let status;
             let len;
@@ -296,7 +356,12 @@ impl Block {
                 status = VIRTIO_BLK_S_OK;
                 len = data.len;
             } else {
-                println!("Type: {:?}, error: {}, len: {}", data.is_read, cqe.result(), data.len);
+                error!(
+                    "Type: {:?}, error: {}, len: {}",
+                    data.is_read,
+                    cqe.result(),
+                    data.len
+                );
                 status = VIRTIO_BLK_S_IOERR;
                 len = 1;
             }
@@ -306,14 +371,44 @@ impl Block {
                 .unwrap();
 
             queue.add_used(&self.mem, data.head_index, len);
+            self.coalesce += 1;
         }
 
         self.in_flight -= cqes.len() as u32;
-        // Okay to signal because we processed some requests from the virtio queue.
-        if self.in_flight == 0 {
+
+        if self.coalesce > self.coalesce_threshold {
+            self.coalesce = 0;
+            self.coalesce_timer_armed = false;
+            self.coalesce_timer.set_state(TimerState::Disarmed, SetTimeFlags::Default);
             let _ = self.signal_used_queue();
         }
-        
+        // Restart the timer so that receiving another queue event is not needed
+        // in order to signal these completions.
+        else if self.coalesce > 0 && !self.coalesce_timer_armed {
+            self.restart_coalesce_timer();
+        }
+    }
+
+    pub(crate) fn process_coalesce_event(&mut self) {
+        //println!("timer fd");
+        self.coalesce_timer.read();
+        self.coalesce_timer_armed = false;
+
+        if self.coalesce > 0 {
+            self.coalesce = 0;
+            //self.coalesce_timer.read();
+            //self.coalesce_timer_armed = false;
+            let _ = self.signal_used_queue();
+        }
+    }
+
+    pub fn compute_coalesce_threshold(&mut self, avg_bs: u32) {
+        match avg_bs {
+            0..=4096 => self.coalesce_threshold = 16,
+            4097..=16184 => self.coalesce_threshold = 8,
+            16185..=129472 => self.coalesce_threshold = 4,
+            _ => self.coalesce_threshold = 4,
+        }
     }
 
     pub(crate) fn signal_used_queue(&self) -> result::Result<(), DeviceError> {
@@ -407,6 +502,9 @@ impl VirtioDevice for Block {
     }
 
     fn set_device_activated(&mut self, device_activated: bool) {
+        let timer_state = TimerState::Oneshot(Duration::from_millis(COALESCE_TIMEOUT * 2));
+        self.coalesce_timer
+            .set_state(timer_state, SetTimeFlags::Default);
         self.device_activated = device_activated;
     }
 

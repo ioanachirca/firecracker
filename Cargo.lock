@@ -142,6 +142,7 @@ dependencies = [
  "net_gen",
  "polly",
  "rate_limiter",
+ "timerfd",
  "utils",
  "virtio_gen",
  "vmm-sys-util",

@@ -19,6 +19,7 @@ impl Subscriber for Block {
         let queue_evt = self.queue_evt.as_raw_fd();
         let rate_limiter_evt = self.rate_limiter.as_raw_fd();
         let completion_evt = self.completion_evt.as_raw_fd();
+        let coalesce_evt = self.coalesce_timer.as_raw_fd();
 
         let source = event.fd();
         let event_set = event.event_set();
@@ -39,6 +40,7 @@ impl Subscriber for Block {
             _ if queue_evt == source => self.process_queue_event(),
             _ if rate_limiter_evt == source => self.process_rate_limiter_event(),
             _ if completion_evt == source => self.process_completion_event(),
+            _ if coalesce_evt == source => self.process_coalesce_event(),
             _ => warn!("Spurious event received: {:?}", source),
         }
     }
@@ -49,6 +51,7 @@ impl Subscriber for Block {
             EpollEvent::new(EventSet::IN, self.rate_limiter.as_raw_fd() as u64),
             EpollEvent::new(EventSet::IN, self.queue_evt.as_raw_fd() as u64),
             EpollEvent::new(EventSet::IN, self.completion_evt.as_raw_fd() as u64),
+            EpollEvent::new(EventSet::IN, self.coalesce_timer.as_raw_fd() as u64),
         ]
     }
 }

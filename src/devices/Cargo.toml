@@ -8,6 +8,7 @@ edition = "2018"
 byteorder = ">=1.2.1"
 libc = ">=0.2.39"
 io-uring = "0.3.2"
+timerfd = "1.0"
 
 dumbo = { path = "../dumbo" }
 logger = { path = "../logger" }
