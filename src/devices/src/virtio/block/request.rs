@@ -73,11 +73,11 @@ pub struct Request {
 }
 
 pub struct IoUringData<'a> {
-    pub is_read: bool, // type of request
+    pub is_read: bool,         // type of request
     buf: [io::IoSlice<'a>; 1], // memory it refers to
-    pub addr: u64, // request status address
-    pub head_index: u16, // virtio queue index of request
-    pub len: u32, // len of request
+    pub addr: u64,             // request status address
+    pub head_index: u16,       // virtio queue index of request
+    pub len: u32,              // len of request
 }
 
 /// The request header represents the mandatory fields of each block device request.
@@ -189,11 +189,18 @@ impl Request {
         Ok(req)
     }
 
-    fn queue_request(&self, ring: &mut io_uring::IoUring, mem: &GuestMemory, fd: RawFd, is_read: bool, index: u16) {
+    fn queue_request(
+        &self,
+        ring: &mut io_uring::IoUring,
+        mem: &GuestMemory,
+        fd: RawFd,
+        is_read: bool,
+        index: u16,
+    ) {
         let mem_slice = mem
             .get_memory_slice(self.data_addr, self.data_len as usize)
             .unwrap();
-        
+
         let buf = [io::IoSlice::new(mem_slice)];
 
         let data = IoUringData {
@@ -209,10 +216,12 @@ impl Request {
 
         let sqe = if is_read {
             io_uring::opcode::Readv::new(target, (*boxed_data).buf.as_ptr() as *mut _, 1)
-                .offset((self.sector << SECTOR_SHIFT) as i64).build()
+                .offset((self.sector << SECTOR_SHIFT) as i64)
+                .build()
         } else {
             io_uring::opcode::Writev::new(target, (*boxed_data).buf.as_ptr() as *const _, 1)
-                .offset((self.sector << SECTOR_SHIFT) as i64).build()
+                .offset((self.sector << SECTOR_SHIFT) as i64)
+                .build()
         };
 
         let boxed_data_ptr = Box::into_raw(boxed_data) as u64;
@@ -220,9 +229,7 @@ impl Request {
         unsafe {
             let mut queue = ring.submission().available();
             queue
-                .push(
-                    sqe.user_data(boxed_data_ptr)
-                )
+                .push(sqe.user_data(boxed_data_ptr))
                 .ok()
                 .expect("io_uring queue is full");
             queue.sync();

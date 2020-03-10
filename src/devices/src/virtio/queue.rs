@@ -309,6 +309,54 @@ impl Queue {
         )
     }
 
+    /// Get next avail desc index value from the avail ring.
+    pub fn get_next_avail(&mut self, mem: &GuestMemory) -> u16 {
+        let index_offset = 4 + 2 * (self.next_avail.0 % self.actual_size());
+
+        let desc_index: u16 = mem
+            .read_obj_from_addr(self.avail_ring.unchecked_add(u64::from(index_offset)))
+            .unwrap();
+
+        return desc_index;
+    }
+
+    /// Get the used event for which the guest expects to get an interrupt.
+    /// This should be called only when VIRTIO_RING_F_EVENT_IDX has been negociated.
+    #[inline(always)]
+    pub fn get_used_event(&mut self, mem: &GuestMemory) -> Option<Wrapping<u16>> {
+        // We need to find the `used_event` field from the avail ring.
+        let event_offset = 4 + 2 * self.actual_size();
+
+        // This fence ensures we're seeing the latest update from the guest.
+        fence(Ordering::Acquire);
+
+        // `self.is_valid()` already performed all the bound checks on the descriptor table
+        // and virtq rings, so it's safe to unwrap guest memory reads and to use unchecked
+        // offsets.
+        let event: u16 = mem
+            .read_obj_from_addr(self.avail_ring.unchecked_add(u64::from(event_offset)))
+            .unwrap();
+
+        return Some(Wrapping(event));
+    }
+
+    /// Update the avail event for which the host expects to get a kick with the 
+    /// last index in the avail ring.
+    /// This should be called only when VIRTIO_RING_F_EVENT_IDX has been negociated.
+    pub fn update_avail_event(&mut self, mem: &GuestMemory) {
+        // We need to find the `avail_event` field from the used ring.
+        let event_offset = 4 + 8 * self.actual_size();
+
+        // `self.is_valid()` already performed all the bound checks on the descriptor table
+        // and virtq rings, so it's safe to unwrap guest memory reads and to use unchecked
+        // offsets.
+        mem.write_obj_at_addr(self.get_next_avail(mem), self.used_ring.unchecked_add(u64::from(event_offset)))
+            .unwrap();
+
+        // This fence ensures the guest sees the value we've just written.
+        fence(Ordering::Release);
+    }
+
     /// Undo the effects of the last `self.pop()` call.
     /// The caller can use this, if it was unable to consume the last popped descriptor chain.
     pub fn undo_pop(&mut self) {
@@ -316,13 +364,13 @@ impl Queue {
     }
 
     /// Puts an available descriptor head into the used ring for use by the guest.
-    pub fn add_used(&mut self, mem: &GuestMemory, desc_index: u16, len: u32) {
+    pub fn add_used(&mut self, mem: &GuestMemory, desc_index: u16, len: u32) -> Option<Wrapping<u16>> {
         if desc_index >= self.actual_size() {
             error!(
                 "attempted to add out of bounds descriptor to used ring: {}",
                 desc_index
             );
-            return;
+            return None;
         }
 
         let used_ring = self.used_ring;
@@ -342,6 +390,8 @@ impl Queue {
 
         mem.write_obj_at_addr(self.next_used.0 as u16, used_ring.unchecked_add(2))
             .unwrap();
+
+        Some(Wrapping(self.next_used.0))
     }
 
     /// Goes back one position in the available descriptor chain offered by the driver.
