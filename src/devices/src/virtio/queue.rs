@@ -310,8 +310,9 @@ impl Queue {
     }
 
     /// Get next avail desc index value from the avail ring.
-    pub fn get_next_avail(&mut self, mem: &GuestMemory) -> u16 {
-        let index_offset = 4 + 2 * (self.next_avail.0 % self.actual_size());
+    pub fn get_next_avail(&self, mem: &GuestMemory) -> u16 {
+        //let index_offset = 4 + 2 * (self.next_avail.0 % self.actual_size());
+        let index_offset: u64 = 2;
 
         let desc_index: u16 = mem
             .read_obj_from_addr(self.avail_ring.unchecked_add(u64::from(index_offset)))
@@ -323,7 +324,7 @@ impl Queue {
     /// Get the used event for which the guest expects to get an interrupt.
     /// This should be called only when VIRTIO_RING_F_EVENT_IDX has been negociated.
     #[inline(always)]
-    pub fn get_used_event(&mut self, mem: &GuestMemory) -> Option<Wrapping<u16>> {
+    pub fn get_used_event(&self, mem: &GuestMemory) -> Option<Wrapping<u16>> {
         // We need to find the `used_event` field from the avail ring.
         let event_offset = 4 + 2 * self.actual_size();
 
@@ -334,7 +335,7 @@ impl Queue {
         // and virtq rings, so it's safe to unwrap guest memory reads and to use unchecked
         // offsets.
         let event: u16 = mem
-            .read_obj_from_addr(self.avail_ring.unchecked_add(u64::from(event_offset)))
+            .read_obj_from_addr::<u16>(self.avail_ring.unchecked_add(u64::from(event_offset)))
             .unwrap();
 
         return Some(Wrapping(event));
@@ -350,7 +351,25 @@ impl Queue {
         // `self.is_valid()` already performed all the bound checks on the descriptor table
         // and virtq rings, so it's safe to unwrap guest memory reads and to use unchecked
         // offsets.
-        mem.write_obj_at_addr(self.get_next_avail(mem), self.used_ring.unchecked_add(u64::from(event_offset)))
+
+        //let avail_value = self.next_avail.0;
+        //println!("next_avail.0: {}", self.next_avail.0);
+        let index_addr = match mem.checked_offset(self.avail_ring, 2) {
+            Some(ret) => ret,
+            None => {
+                warn!("invalid offset");
+                return;
+            }
+        };
+        let last_index: u16 = match mem.read_obj_from_addr::<u16>(index_addr) {
+            Ok(ret) => ret,
+            Err(_) => return,
+        };
+
+        // if last_index == 79 {
+        //     println!("beware!!");
+        // }
+        mem.write_obj_at_addr(last_index, self.used_ring.unchecked_add(u64::from(event_offset)))
             .unwrap();
 
         // This fence ensures the guest sees the value we've just written.

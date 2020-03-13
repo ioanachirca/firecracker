@@ -23,7 +23,6 @@ use virtio_gen::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
 
 use io_uring;
 use memory_model::GuestAddress;
-use std::sync::atomic::fence;
 use std::num::Wrapping;
 
 use std::os::unix::io::AsRawFd;
@@ -31,7 +30,7 @@ use std::os::unix::io::AsRawFd;
 use super::{
     super::{ActivateResult, Queue, VirtioDevice, TYPE_BLOCK, VIRTIO_MMIO_INT_VRING},
     request::*,
-    Error, CONFIG_SPACE_SIZE, QUEUE_SIZES, SECTOR_SHIFT, SECTOR_SIZE,
+    Error, CONFIG_SPACE_SIZE, QUEUE_SIZE, QUEUE_SIZES, SECTOR_SHIFT, SECTOR_SIZE,
 };
 
 use crate::Error as DeviceError;
@@ -109,9 +108,9 @@ pub struct Block {
     pub(crate) ring: io_uring::IoUring,
     pub(crate) completion_evt: EventFd,
     pub(crate) in_flight: u32,
+    pub(crate) remaining: bool,
 
     // Virtio notification suppression related fields.
-    pub(crate) event_idx: bool,
     pub(crate) signalled_used: Option<Wrapping<u16>>,
 }
 
@@ -145,7 +144,8 @@ impl Block {
 
         let queues = QUEUE_SIZES.iter().map(|&s| Queue::new(s)).collect();
 
-        let ring = io_uring::IoUring::new(128).unwrap();
+        let ring = io_uring::IoUring::new(QUEUE_SIZE as u32).unwrap();
+        //let ring = io_uring::IoUring::new(1).unwrap();
         let completion_evt = EventFd::new(libc::EFD_NONBLOCK)?;
 
         // Register the completion_evt in order to get notified of IoUring completions.
@@ -169,40 +169,44 @@ impl Block {
             ring: ring,
             completion_evt: completion_evt,
             in_flight: 0,
-            event_idx: true, // this needs a check
             signalled_used: None,
+            remaining: false,
         })
     }
 
-    pub(crate) fn event_idx_flag_set(&mut self) -> bool {
+    pub(crate) fn event_idx(&mut self) -> bool {
         self.acked_features() & (1u64 << VIRTIO_RING_F_EVENT_IDX) != 0
     }
 
+    pub(crate) fn set_notification(&mut self) {
+        if !self.event_idx() {
+            return;
+        }
+        self.queues[0].update_avail_event(&self.mem);
+    }
+        
     pub(crate) fn process_queue_event(&mut self) {
+        //println!("queue event!");
         METRICS.block.queue_event_count.inc();
         if let Err(e) = self.queue_evt.read() {
             error!("Failed to get queue event: {:?}", e);
             METRICS.block.event_fails.inc();
         } else {
-            if self.rate_limiter.is_blocked() {
-                return;
-            }
-
-            if self.event_idx {
-                // to properly support EVENT_IDX we need to keep
-                // calling process_queue() until it stops finding new
-                // requests on the queue. ??????
+            if self.event_idx() {
                 loop {
-                    self.queues[0].update_avail_event(&self.mem);
-                    if !self.process_queue(0) {
+                    self.set_notification();
+                    if self.rate_limiter.is_blocked() || !self.process_queue(0) {
                         break;
                     }
                 }
             } else {
-                self.process_queue(0);
+                if !self.rate_limiter.is_blocked() && self.process_queue(0) {
+                    let _ = self.signal_used_queue();
+                }
             }
         }
     }
+    
 
     pub(crate) fn process_rate_limiter_event(&mut self) {
         METRICS.block.rate_limiter_event_count.inc();
@@ -214,13 +218,11 @@ impl Block {
     }
 
     pub(crate) fn process_queue(&mut self, queue_index: usize) -> bool {
-        let queue = &mut self.queues[queue_index];
-        // use_any is not useful anymore
-        let mut used_any = false;
+        let mut used_desc_heads = [(0, 0); QUEUE_SIZE as usize];
+        let mut used_count = 0;
 
-        while let Some(head) = queue.pop(&self.mem) {
-            let len;
-            let mut used_this = false;
+        while let Some(head) = self.queues[queue_index].pop(&self.mem) {
+            let mut len = 0;
             match Request::parse(&head, &self.mem) {
                 Ok(request) => {
                     // If limiter.consume() fails it means there is no more TokenType::Ops
@@ -228,7 +230,7 @@ impl Block {
                     if !self.rate_limiter.consume(1, TokenType::Ops) {
                         // Stop processing the queue and return this descriptor chain to the
                         // avail ring, for later processing.
-                        queue.undo_pop();
+                        self.queues[0].undo_pop();
                         break;
                     }
                     // Exercise the rate limiter only if this request is of data transfer type.
@@ -245,15 +247,16 @@ impl Block {
                             self.rate_limiter.manual_replenish(1, TokenType::Ops);
                             // Stop processing the queue and return this descriptor chain to the
                             // avail ring, for later processing.
-                            queue.undo_pop();
+                            self.queues[0].undo_pop();
                             break;
                         }
                     }
 
                     // Wait for completions if the submission queue is full.
                     if self.in_flight == self.ring.params().cq_entries() {
-                        println!("submission queue is full, wait for more completions");
-                        queue.undo_pop();
+                        //println!("submission queue is full, wait for more completions");
+                        self.queues[0].undo_pop();
+                        self.remaining = true;
                         // will this trigger an event?
                         self.ring.submit_and_wait(self.in_flight as usize).unwrap();
                         break;
@@ -268,17 +271,15 @@ impl Block {
                         head.index,
                     ) {
                         Ok(l) => {
-                            len = l;
                             if request.request_type != RequestType::In
                                 && request.request_type != RequestType::Out
                             {
                                 self.mem
                                     .write_obj_at_addr(VIRTIO_BLK_S_OK, request.status_addr)
                                     .unwrap();
-
-                                //queue.add_used(&self.mem, head.index, len);
-                                //used_any = true;
-                                used_this = true;
+                                len = l;
+                                used_desc_heads[used_count] = (head.index, len);
+                                used_count += 1;
                             } else {
                                 self.in_flight += 1;
                             }
@@ -292,9 +293,8 @@ impl Block {
                                 .write_obj_at_addr(e.status(), request.status_addr)
                                 .unwrap();
 
-                            //queue.add_used(&self.mem, head.index, len);
-                            //used_any = true;
-                            used_this = true;
+                            used_desc_heads[used_count] = (head.index, len);
+                            used_count += 1;
                         }
                     };
                 }
@@ -303,69 +303,46 @@ impl Block {
                     METRICS.block.execute_fails.inc();
                     len = 0;
 
-                    //queue.add_used(&self.mem, head.index, len);
-                    //used_any = true;
-                    used_this = true;
+                    used_desc_heads[used_count] = (head.index, len);
+                    used_count += 1;
                 }
             };
+        }
 
-            if !used_this {
-                continue;
-            }
-
-            // Deal with VIRTIO_RING_F_EVENT_IDX.
-            if self.event_idx {
-                if let Some(used_idx) = queue.add_used(&self.mem, head.index, len) {
-                    // Check if we need to notify the guest.
-                    let mut notify = true;
-                    if let Some(old_idx) = self.signalled_used {
-                        if let Some(used_event) = queue.get_used_event(&self.mem) {
-                            if (used_idx - used_event - Wrapping(1u16)) >= (used_idx - old_idx) {
-                                notify = false;
-                            }
-                        }
-                    }
-                    self.signalled_used = Some(used_idx);
-
-                    if notify {
-                        // Signal used queue.
-                        println!("process_queue: signal_used_queue");
-                        self.interrupt_status
-                            .fetch_or(VIRTIO_MMIO_INT_VRING as usize, Ordering::SeqCst);
-
-                        self.interrupt_evt
-                            .write(1)
-                            .map_err(|e| {
-                                error!("Failed to signal used queue: {:?}", e);
-                                METRICS.block.event_fails.inc();
-                                DeviceError::FailedSignalingUsedQueue(e)
-                            })
-                            .unwrap();
-                    } else {
-                        println!("process_queue: omitting signal_used_queue");
-                    }
-                    used_any = true;
+        for &(desc_index, len) in &used_desc_heads[..used_count] {
+            if let Some(used_idx) = self.queues[queue_index].add_used(&self.mem, desc_index, len) {
+                if self.needs_notification(used_idx) {
+                    //println!("process_queue: signal_used_queue");
+                    let _ = self.signal_used_queue();
+                } else {
+                    //println!("!!!!! process_queue: omitting signal_used_queue");
                 }
-            } else {
-                queue.add_used(&self.mem, head.index, len);
-                // Signal used queue.
-                println!("process_queue: signal_used_queue");
-                self.interrupt_status
-                    .fetch_or(VIRTIO_MMIO_INT_VRING as usize, Ordering::SeqCst);
-
-                self.interrupt_evt
-                    .write(1)
-                    .map_err(|e| {
-                        error!("Failed to signal used queue: {:?}", e);
-                        METRICS.block.event_fails.inc();
-                        DeviceError::FailedSignalingUsedQueue(e)
-                    })
-                    .unwrap();
-
-                used_any = true;
             }
         }
-        used_any
+        self.set_notification();
+        self.remaining = false;
+
+        used_count > 0
+    }
+
+    pub(crate) fn needs_notification(&mut self, used_idx: Wrapping<u16>) -> bool {
+        if !self.event_idx() {
+            return true;
+        }
+
+        let mut notify = true;
+        let queue = &self.queues[0];
+
+        if let Some(old_idx) = self.signalled_used {
+            if let Some(used_event) = queue.get_used_event(&self.mem) {
+                if used_idx - used_event - Wrapping(1u16) >= (used_idx - old_idx) {
+                    notify = false;
+                }
+            }
+        }
+
+        self.signalled_used = Some(used_idx);
+        notify
     }
 
     pub(crate) fn process_completion_event(&mut self) {
@@ -376,17 +353,12 @@ impl Block {
 
         let cqes = self.ring.completion().available().collect::<Vec<_>>();
 
-        let mut first_head_index: i16 = -1;
-
         for cqe in cqes.iter() {
             let data: std::boxed::Box<IoUringData> =
                 unsafe { Box::from_raw(cqe.user_data() as *mut _) };
             let data = *data;
             let status;
             let len;
-            if first_head_index == -1 {
-                first_head_index = data.head_index as i16;
-            }
             if cqe.result() >= 0 {
                 status = VIRTIO_BLK_S_OK;
                 len = data.len;
@@ -406,37 +378,22 @@ impl Block {
                 .unwrap();
 
             let queue = &mut self.queues[0];
-            // Deal with VIRTIO_RING_F_EVENT_IDX.
-            if self.event_idx {
-                if let Some(used_idx) = queue.add_used(&self.mem, data.head_index, len) {
-                    // Check if we need to notify the guest.
-                    let mut notify = true;
-                    if let Some(old_idx) = self.signalled_used {
-                        if let Some(used_event) = queue.get_used_event(&self.mem) {
-                            if (used_idx - used_event - Wrapping(1u16)) >= (used_idx - old_idx) {
-                                notify = false;
-                            }
-                        }
-                    }
-                    self.signalled_used = Some(used_idx);
-
-                    if notify {
-                        // Signal used queue.
-                        println!("process_compl: signal_used_queue");
-                        let _ = self.signal_used_queue();
-                    } else {
-                        println!("process_compl: omitting signal_used_queue");
-                    }
-                }
-            } else {
-                queue.add_used(&self.mem, data.head_index, len);
-                // Signal used queue.
-                println!("process_queue: signal_used_queue");
+            // before it was data.head_index (wrong)
+            let used_idx = queue.add_used(&self.mem, data.head_index, len).unwrap();
+            if self.needs_notification(Wrapping(used_idx.0)) {
+                //println!("process_compl: signal_used_queue");
                 let _ = self.signal_used_queue();
-            }
+            } else {
+                //println!("process_compl: omitting signal_used_queue");
+            }            
         }
 
         self.in_flight -= cqes.len() as u32;
+
+        // Maybe there were some unprocessed events
+        if self.remaining {
+            self.process_queue(0);
+        }
     }
 
     pub(crate) fn signal_used_queue(&mut self) -> result::Result<(), DeviceError> {
@@ -531,7 +488,7 @@ impl VirtioDevice for Block {
 
     fn set_device_activated(&mut self, device_activated: bool) {
         self.device_activated = device_activated;
-        println!("EVENT_IDX is set? {}", self.event_idx_flag_set());
+        println!("EVENT_IDX is set? {}", self.event_idx());
     }
 
     fn activate(&mut self, _mem: GuestMemory) -> ActivateResult {
