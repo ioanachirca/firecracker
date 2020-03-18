@@ -63,7 +63,7 @@ impl From<u32> for RequestType {
         }
     }
 }
-
+#[derive(Clone)]
 pub struct Request {
     pub request_type: RequestType,
     pub data_len: u32,
@@ -73,11 +73,57 @@ pub struct Request {
 }
 
 pub struct IoUringData<'a> {
-    pub is_read: bool,         // type of request
+    pub request: Request,
     buf: [io::IoSlice<'a>; 1], // memory it refers to
-    pub addr: u64,             // request status address
-    pub head_index: u16,       // virtio queue index of request
-    pub len: u32,              // len of request
+    pub desc_index: u16,       // virtio queue index of request
+}
+
+fn queue_request(
+    request: Request,
+    ring: &mut io_uring::IoUring,
+    mem: &GuestMemory,
+    fd: RawFd,
+    is_read: bool,
+    index: u16,
+) {
+    let mem_slice = mem
+        .get_memory_slice(request.data_addr, request.data_len as usize)
+        .unwrap();
+
+    let buf = [io::IoSlice::new(mem_slice)];
+
+    let data = IoUringData {
+        request: request.clone(),
+        buf: buf,
+        desc_index: index,
+    };
+
+    let boxed_data = Box::new(data);
+    let target = io_uring::opcode::types::Target::Fd(fd);
+
+    let sqe = if is_read {
+        io_uring::opcode::Readv::new(target, (*boxed_data).buf.as_ptr() as *mut _, 1)
+            .offset((request.sector << SECTOR_SHIFT) as i64)
+            .build()
+    } else {
+        io_uring::opcode::Writev::new(target, (*boxed_data).buf.as_ptr() as *const _, 1)
+            .offset((request.sector << SECTOR_SHIFT) as i64)
+            .build()
+            //.flags(io_uring::squeue::Flags::IO_DRAIN)
+    };
+
+    let boxed_data_ptr = Box::into_raw(boxed_data) as u64;
+
+    unsafe {
+        let mut queue = ring.submission().available();
+        queue
+            .push(sqe.user_data(boxed_data_ptr))
+            .ok()
+            .expect("io_uring queue is full");
+        queue.sync();
+    }
+
+    ring.submit().unwrap();
 }
 
 /// The request header represents the mandatory fields of each block device request.
@@ -189,55 +235,6 @@ impl Request {
         Ok(req)
     }
 
-    fn queue_request(
-        &self,
-        ring: &mut io_uring::IoUring,
-        mem: &GuestMemory,
-        fd: RawFd,
-        is_read: bool,
-        index: u16,
-    ) {
-        let mem_slice = mem
-            .get_memory_slice(self.data_addr, self.data_len as usize)
-            .unwrap();
-
-        let buf = [io::IoSlice::new(mem_slice)];
-
-        let data = IoUringData {
-            is_read: true,
-            buf: buf,
-            addr: self.status_addr.0,
-            head_index: index,
-            len: self.data_len,
-        };
-
-        let boxed_data = Box::new(data);
-        let target = io_uring::opcode::types::Target::Fd(fd);
-
-        let sqe = if is_read {
-            io_uring::opcode::Readv::new(target, (*boxed_data).buf.as_ptr() as *mut _, 1)
-                .offset((self.sector << SECTOR_SHIFT) as i64)
-                .build()
-        } else {
-            io_uring::opcode::Writev::new(target, (*boxed_data).buf.as_ptr() as *const _, 1)
-                .offset((self.sector << SECTOR_SHIFT) as i64)
-                .build()
-        };
-
-        let boxed_data_ptr = Box::into_raw(boxed_data) as u64;
-
-        unsafe {
-            let mut queue = ring.submission().available();
-            queue
-                .push(sqe.user_data(boxed_data_ptr))
-                .ok()
-                .expect("io_uring queue is full");
-            queue.sync();
-        }
-
-        ring.submit().unwrap();
-    }
-
     pub fn execute<T: Seek + Read + Write + AsRawFd>(
         &self,
         disk: &mut T,
@@ -260,14 +257,14 @@ impl Request {
 
         match self.request_type {
             RequestType::In => {
-                self.queue_request(ring, mem, disk.as_raw_fd(), true, head_index);
+                queue_request(self.clone(), ring, mem, disk.as_raw_fd(), true, head_index);
 
                 METRICS.block.read_bytes.add(self.data_len as usize);
                 METRICS.block.read_count.inc();
                 return Ok(self.data_len);
             }
             RequestType::Out => {
-                self.queue_request(ring, mem, disk.as_raw_fd(), false, head_index);
+                queue_request(self.clone(), ring, mem, disk.as_raw_fd(), false, head_index);
 
                 METRICS.block.write_bytes.add(self.data_len as usize);
                 METRICS.block.write_count.inc();

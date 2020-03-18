@@ -22,10 +22,10 @@ use virtio_gen::virtio_blk::*;
 use virtio_gen::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
 
 use io_uring;
-use memory_model::GuestAddress;
 use std::num::Wrapping;
 
 use std::os::unix::io::AsRawFd;
+use std::time::SystemTime;
 
 use super::{
     super::{ActivateResult, Queue, VirtioDevice, TYPE_BLOCK, VIRTIO_MMIO_INT_VRING},
@@ -112,6 +112,10 @@ pub struct Block {
 
     // Virtio notification suppression related fields.
     pub(crate) signalled_used: Option<Wrapping<u16>>,
+
+    // Interrupt-rate related fields.
+    pub(crate) previous_ts: SystemTime,
+    pub(crate) intr_count: u64,
 }
 
 impl Block {
@@ -171,6 +175,8 @@ impl Block {
             in_flight: 0,
             signalled_used: None,
             remaining: false,
+            previous_ts: SystemTime::now(),
+            intr_count: 0,
         })
     }
 
@@ -184,7 +190,20 @@ impl Block {
         }
         self.queues[0].update_avail_event(&self.mem);
     }
-        
+
+    pub(crate) fn process_interrupt_rate(&mut self) {
+        let diff = SystemTime::now().duration_since(self.previous_ts).unwrap();
+        if diff.as_millis() < 1000 {
+            self.intr_count += 1;
+        } else {
+            //let rate = (self.intr_count * 1000) as f64 / diff.as_millis() as f64;
+            let rate = self.intr_count;
+            println!("RATE: {:.2}k   ", rate as f64 / 1000 as f64);
+            self.intr_count = 1;
+            self.previous_ts = SystemTime::now();
+        }
+    }
+
     pub(crate) fn process_queue_event(&mut self) {
         //println!("queue event!");
         METRICS.block.queue_event_count.inc();
@@ -206,7 +225,6 @@ impl Block {
             }
         }
     }
-    
 
     pub(crate) fn process_rate_limiter_event(&mut self) {
         METRICS.block.rate_limiter_event_count.inc();
@@ -253,11 +271,11 @@ impl Block {
                     }
 
                     // Wait for completions if the submission queue is full.
-                    if self.in_flight == self.ring.params().cq_entries() {
-                        //println!("submission queue is full, wait for more completions");
+                    if self.in_flight == self.ring.params().cq_entries()
+                        || request.request_type == RequestType::Flush && self.in_flight > 0
+                    {
                         self.queues[0].undo_pop();
                         self.remaining = true;
-                        // will this trigger an event?
                         self.ring.submit_and_wait(self.in_flight as usize).unwrap();
                         break;
                     }
@@ -361,34 +379,39 @@ impl Block {
             let len;
             if cqe.result() >= 0 {
                 status = VIRTIO_BLK_S_OK;
-                len = data.len;
+                if data.request.data_len != cqe.result() as u32{
+                    println!("Mismatch: initial = {}, final = {}", data.request.data_len, cqe.result());
+                }
+                len = data.request.data_len;
             } else {
                 println!(
                     "Type: {:?}, error: {}, len: {}",
-                    data.is_read,
+                    data.request.request_type == RequestType::In,
                     cqe.result(),
-                    data.len
+                    data.request.data_len
                 );
                 status = VIRTIO_BLK_S_IOERR;
                 len = 1;
             }
 
             self.mem
-                .write_obj_at_addr(status, GuestAddress(data.addr))
+                .write_obj_at_addr(status, data.request.status_addr)
                 .unwrap();
 
             let queue = &mut self.queues[0];
-            // before it was data.head_index (wrong)
-            let used_idx = queue.add_used(&self.mem, data.head_index, len).unwrap();
-            if self.needs_notification(Wrapping(used_idx.0)) {
-                //println!("process_compl: signal_used_queue");
-                let _ = self.signal_used_queue();
-            } else {
-                //println!("process_compl: omitting signal_used_queue");
-            }            
+            if let Some(used_idx) = queue.add_used(&self.mem, data.desc_index, len) {
+                if self.needs_notification(used_idx) {
+                    //println!("process_queue: signal_used_queue");
+                    let _ = self.signal_used_queue();
+                } else {
+                    //println!("!!!!! process_queue: omitting signal_used_queue");
+                }
+            }
         }
 
         self.in_flight -= cqes.len() as u32;
+
+        self.set_notification();
 
         // Maybe there were some unprocessed events
         if self.remaining {
@@ -397,6 +420,8 @@ impl Block {
     }
 
     pub(crate) fn signal_used_queue(&mut self) -> result::Result<(), DeviceError> {
+        //self.process_interrupt_rate();
+
         self.interrupt_status
             .fetch_or(VIRTIO_MMIO_INT_VRING as usize, Ordering::SeqCst);
 

@@ -329,7 +329,7 @@ impl Queue {
         let event_offset = 4 + 2 * self.actual_size();
 
         // This fence ensures we're seeing the latest update from the guest.
-        fence(Ordering::Acquire);
+        fence(Ordering::SeqCst);
 
         // `self.is_valid()` already performed all the bound checks on the descriptor table
         // and virtq rings, so it's safe to unwrap guest memory reads and to use unchecked
@@ -341,7 +341,7 @@ impl Queue {
         return Some(Wrapping(event));
     }
 
-    /// Update the avail event for which the host expects to get a kick with the 
+    /// Update the avail event for which the host expects to get a kick with the
     /// last index in the avail ring.
     /// This should be called only when VIRTIO_RING_F_EVENT_IDX has been negociated.
     pub fn update_avail_event(&mut self, mem: &GuestMemory) {
@@ -369,8 +369,11 @@ impl Queue {
         // if last_index == 79 {
         //     println!("beware!!");
         // }
-        mem.write_obj_at_addr(last_index, self.used_ring.unchecked_add(u64::from(event_offset)))
-            .unwrap();
+        mem.write_obj_at_addr(
+            last_index,
+            self.used_ring.unchecked_add(u64::from(event_offset)),
+        )
+        .unwrap();
 
         // This fence ensures the guest sees the value we've just written.
         fence(Ordering::Release);
@@ -383,7 +386,12 @@ impl Queue {
     }
 
     /// Puts an available descriptor head into the used ring for use by the guest.
-    pub fn add_used(&mut self, mem: &GuestMemory, desc_index: u16, len: u32) -> Option<Wrapping<u16>> {
+    pub fn add_used(
+        &mut self,
+        mem: &GuestMemory,
+        desc_index: u16,
+        len: u32,
+    ) -> Option<Wrapping<u16>> {
         if desc_index >= self.actual_size() {
             error!(
                 "attempted to add out of bounds descriptor to used ring: {}",
