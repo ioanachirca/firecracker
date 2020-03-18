@@ -24,6 +24,7 @@ use io_uring;
 use memory_model::GuestAddress;
 
 use std::os::unix::io::AsRawFd;
+use std::time::SystemTime;
 
 use super::{
     super::{ActivateResult, Queue, VirtioDevice, TYPE_BLOCK, VIRTIO_MMIO_INT_VRING},
@@ -106,6 +107,10 @@ pub struct Block {
     pub(crate) ring: io_uring::IoUring,
     pub(crate) completion_evt: EventFd,
     pub(crate) in_flight: u32,
+
+    // Interrupt-rate related fields.
+    pub(crate) previous_ts: SystemTime,
+    pub(crate) intr_count: u64,
 }
 
 impl Block {
@@ -160,7 +165,21 @@ impl Block {
             ring: ring,
             completion_evt: completion_evt,
             in_flight: 0,
+            previous_ts: SystemTime::now(),
+            intr_count: 0,
         })
+    }
+
+    pub(crate) fn process_interrupt_rate(&mut self) {
+        let diff = SystemTime::now().duration_since(self.previous_ts).unwrap();
+        if diff.as_secs() < 1 {
+            self.intr_count += 1;
+        } else {
+            let rate = (self.intr_count * 1000) as f64 / diff.as_millis() as f64;
+            println!("RATE: {:.2}   ", rate);
+            self.intr_count = 0;
+            self.previous_ts = SystemTime::now();
+        }
     }
 
     pub(crate) fn process_queue_event(&mut self) {
@@ -169,6 +188,7 @@ impl Block {
             error!("Failed to get queue event: {:?}", e);
             METRICS.block.event_fails.inc();
         } else if !self.rate_limiter.is_blocked() && self.process_queue(0) {
+            self.process_interrupt_rate();
             let _ = self.signal_used_queue();
         }
     }
@@ -311,6 +331,7 @@ impl Block {
         self.in_flight -= cqes.len() as u32;
         // Okay to signal because we processed some requests from the virtio queue.
         if self.in_flight == 0 {
+            self.process_interrupt_rate();
             let _ = self.signal_used_queue();
         }
         

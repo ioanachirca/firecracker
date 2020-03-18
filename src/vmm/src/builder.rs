@@ -610,8 +610,10 @@ fn attach_block_devices(
 
     for drive_config in blocks.config_list.iter() {
         // Add the block device from file.
+        use std::{os::unix::fs::OpenOptionsExt};
         let block_file = OpenOptions::new()
             .read(true)
+            .custom_flags(libc::O_DIRECT)
             .write(!drive_config.is_read_only)
             .open(&drive_config.path_on_host)
             .map_err(OpenBlockDevice)?;
