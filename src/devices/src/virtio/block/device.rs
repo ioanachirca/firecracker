@@ -26,6 +26,7 @@ use std::time::Duration;
 use timerfd::{ClockId, SetTimeFlags, TimerFd, TimerState};
 
 use std::os::unix::io::AsRawFd;
+use std::time::SystemTime;
 
 use super::{
     super::{ActivateResult, Queue, VirtioDevice, TYPE_BLOCK, VIRTIO_MMIO_INT_VRING},
@@ -116,6 +117,10 @@ pub struct Block {
     pub(crate) coalesce: u32,
     pub(crate) coalesce_timer: TimerFd,
     pub(crate) coalesce_timer_armed: bool,
+
+    // Interrupt-rate related fields.
+    pub(crate) previous_ts: SystemTime,
+    pub(crate) intr_count: u64,
 }
 
 impl Block {
@@ -178,6 +183,8 @@ impl Block {
             coalesce: 0,
             coalesce_timer: coalesce_timer,
             coalesce_timer_armed: false,
+            previous_ts: SystemTime::now(),
+            intr_count: 0,
         })
     }
 
@@ -186,6 +193,18 @@ impl Block {
         self.coalesce_timer
             .set_state(timer_state, SetTimeFlags::Default);
         self.coalesce_timer_armed = true;
+    }
+
+    pub(crate) fn process_interrupt_rate(&mut self) {
+        let diff = SystemTime::now().duration_since(self.previous_ts).unwrap();
+        if diff.as_secs() < 1 {
+            self.intr_count += 1;
+        } else {
+            let rate = (self.intr_count * 1000) as f64 / diff.as_millis() as f64;
+            println!("RATE: {:.2}   ", rate);
+            self.intr_count = 0;
+            self.previous_ts = SystemTime::now();
+        }
     }
 
     pub(crate) fn process_queue_event(&mut self) {
@@ -199,6 +218,7 @@ impl Block {
                 self.coalesce = 0;
                 self.coalesce_timer_armed = false;
                 self.coalesce_timer.set_state(TimerState::Disarmed, SetTimeFlags::Default);
+                self.process_interrupt_rate();
                 let _ = self.signal_used_queue();
             }
             // This catches the case in which there is a FLUSH/GET_DEVICE_ID request.
@@ -215,6 +235,7 @@ impl Block {
         if self.rate_limiter.event_handler().is_ok() && self.process_queue(0) {
             if self.coalesce > 8 {
                 self.coalesce = 0;
+                self.process_interrupt_rate();
                 let _ = self.signal_used_queue();
             }
         }
@@ -380,6 +401,7 @@ impl Block {
             self.coalesce = 0;
             self.coalesce_timer_armed = false;
             self.coalesce_timer.set_state(TimerState::Disarmed, SetTimeFlags::Default);
+            self.process_interrupt_rate();
             let _ = self.signal_used_queue();
         }
         // Restart the timer so that receiving another queue event is not needed
@@ -398,6 +420,7 @@ impl Block {
             self.coalesce = 0;
             //self.coalesce_timer.read();
             //self.coalesce_timer_armed = false;
+            self.process_interrupt_rate();
             let _ = self.signal_used_queue();
         }
     }
