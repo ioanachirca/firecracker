@@ -17,6 +17,7 @@ use std::sync::Arc;
 use logger::{Metric, METRICS};
 use rate_limiter::{RateLimiter, TokenType};
 use utils::eventfd::EventFd;
+use virtio_gen::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
 use virtio_gen::virtio_blk::*;
 use vm_memory::{Bytes, GuestMemoryMmap};
 
@@ -25,6 +26,9 @@ use super::{
     request::*,
     Error, CONFIG_SPACE_SIZE, QUEUE_SIZES, SECTOR_SHIFT, SECTOR_SIZE,
 };
+
+
+use std::num::Wrapping;
 
 use crate::Error as DeviceError;
 
@@ -100,6 +104,9 @@ pub struct Block {
 
     // Implementation specific fields.
     pub(crate) rate_limiter: RateLimiter,
+
+    // Virtio notification suppression related fields.
+    pub(crate) signalled_used: Option<Wrapping<u16>>,
 }
 
 impl Block {
@@ -115,6 +122,7 @@ impl Block {
         let disk_size = disk_image.seek(SeekFrom::End(0))? as u64;
 
         let mut avail_features = (1u64 << VIRTIO_F_VERSION_1) | (1u64 << VIRTIO_BLK_F_FLUSH);
+        avail_features |= 1u64 << VIRTIO_RING_F_EVENT_IDX;
 
         if is_disk_read_only {
             avail_features |= 1u64 << VIRTIO_BLK_F_RO;
@@ -138,7 +146,19 @@ impl Block {
             queue_evts,
             queues,
             device_activated: false,
+            signalled_used: None,
         })
+    }
+
+    pub(crate) fn event_idx(&self) -> bool {
+        self.acked_features() & (1u64 << VIRTIO_RING_F_EVENT_IDX) != 0
+    }
+
+    pub(crate) fn set_notification(&mut self) {
+        if !self.event_idx() {
+            return;
+        }
+        self.queues[0].update_avail_event(&self.mem);
     }
 
     pub(crate) fn process_queue_event(&mut self) {
@@ -146,8 +166,19 @@ impl Block {
         if let Err(e) = self.queue_evts[0].read() {
             error!("Failed to get queue event: {:?}", e);
             METRICS.block.event_fails.inc();
-        } else if !self.rate_limiter.is_blocked() && self.process_queue(0) {
-            let _ = self.signal_used_queue();
+        } else  {
+            if self.event_idx() {
+                loop {
+                    self.set_notification();
+                    if self.rate_limiter.is_blocked() || !self.process_queue(0) {
+                        break;
+                    }
+                }
+            } else {
+                if !self.rate_limiter.is_blocked() {
+                    self.process_queue(0);
+                }
+            }
         }
     }
 
@@ -161,9 +192,8 @@ impl Block {
     }
 
     pub(crate) fn process_queue(&mut self, queue_index: usize) -> bool {
-        let queue = &mut self.queues[queue_index];
         let mut used_any = false;
-        while let Some(head) = queue.pop(&self.mem) {
+        while let Some(head) = self.queues[queue_index].pop(&self.mem) {
             let len;
             match Request::parse(&head, &self.mem) {
                 Ok(request) => {
@@ -172,7 +202,7 @@ impl Block {
                     if !self.rate_limiter.consume(1, TokenType::Ops) {
                         // Stop processing the queue and return this descriptor chain to the
                         // avail ring, for later processing.
-                        queue.undo_pop();
+                        self.queues[queue_index].undo_pop();
                         break;
                     }
                     // Exercise the rate limiter only if this request is of data transfer type.
@@ -189,7 +219,7 @@ impl Block {
                             self.rate_limiter.manual_replenish(1, TokenType::Ops);
                             // Stop processing the queue and return this descriptor chain to the
                             // avail ring, for later processing.
-                            queue.undo_pop();
+                            self.queues[queue_index].undo_pop();
                             break;
                         }
                     }
@@ -220,14 +250,48 @@ impl Block {
                     len = 0;
                 }
             }
-            queue.add_used(&self.mem, head.index, len);
-            used_any = true;
+
+            if self.event_idx() {
+                if let Some(used_idx) = self.queues[queue_index].add_used(&self.mem, head.index, len) {
+                    if self.needs_notification(used_idx) {
+                        //println!("process_queue: signal_used_queue");
+                        let _ = self.signal_used_queue();
+                    } else {
+                        //println!("process_queue: omitting signal_used_queue");
+                    }
+                    used_any = true;
+                }
+            } else {
+                self.queues[queue_index].add_used(&self.mem, head.index, len);
+                let _ = self.signal_used_queue();
+                used_any = true;
+            }
         }
 
         used_any
     }
 
-    pub(crate) fn signal_used_queue(&self) -> result::Result<(), DeviceError> {
+    pub(crate) fn needs_notification(&mut self, used_idx: Wrapping<u16>) -> bool {
+        if !self.event_idx() {
+            return true;
+        }
+
+        let mut notify = true;
+        let queue = &self.queues[0];
+
+        if let Some(old_idx) = self.signalled_used {
+            if let Some(used_event) = queue.get_used_event(&self.mem) {
+                if used_idx - used_event - Wrapping(1u16) >= (used_idx - old_idx) {
+                    notify = false;
+                }
+            }
+        }
+
+        self.signalled_used = Some(used_idx);
+        notify
+    }
+
+    pub(crate) fn signal_used_queue(&mut self) -> result::Result<(), DeviceError> {
         self.interrupt_status
             .fetch_or(VIRTIO_MMIO_INT_VRING as usize, Ordering::SeqCst);
 
