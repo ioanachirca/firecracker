@@ -651,7 +651,11 @@ impl VirtioDevice for Net {
         TYPE_NET
     }
 
-    fn queues(&mut self) -> &mut [Queue] {
+    fn queues(&self) -> &[Queue] {
+        &self.queues
+    }
+
+    fn queues_mut(&mut self) -> &mut [Queue] {
         &mut self.queues
     }
 
