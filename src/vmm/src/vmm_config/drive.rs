@@ -4,7 +4,6 @@
 use std::collections::VecDeque;
 use std::convert::TryInto;
 use std::fmt::{Display, Formatter};
-use std::fs::OpenOptions;
 use std::io;
 use std::path::PathBuf;
 use std::result;
@@ -163,13 +162,6 @@ impl BlockBuilder {
             return Err(DriveError::InvalidBlockDevicePath);
         }
 
-        // Add the block device from file.
-        let block_file = OpenOptions::new()
-            .read(true)
-            .write(!block_device_config.is_read_only)
-            .open(&block_device_config.path_on_host)
-            .map_err(DriveError::OpenBlockDevice)?;
-
         let rate_limiter = block_device_config
             .rate_limiter
             .map(super::RateLimiterConfig::try_into)
@@ -179,8 +171,8 @@ impl BlockBuilder {
         // Create and return the Block device
         devices::virtio::Block::new(
             block_device_config.drive_id,
-            block_file,
             block_device_config.partuuid,
+            &block_device_config.path_on_host,
             block_device_config.is_read_only,
             block_device_config.is_root_device,
             rate_limiter.unwrap_or_default(),

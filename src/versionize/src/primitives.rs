@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #![allow(clippy::float_cmp)]
 
+use std::path::PathBuf;
+
 use self::super::{Error, VersionMap, Versionize, VersionizeResult};
 use vmm_sys_util::fam::{FamStruct, FamStructWrapper};
 
@@ -61,6 +63,7 @@ impl_versionize!(f32);
 impl_versionize!(f64);
 impl_versionize!(char);
 impl_versionize!(String);
+impl_versionize!(PathBuf);
 
 impl<T> Versionize for Box<T>
 where
