@@ -108,7 +108,7 @@ impl MmioTransport {
     fn with_queue_mut<F: FnOnce(&mut Queue)>(&mut self, f: F) -> bool {
         if let Some(queue) = self
             .locked_device()
-            .queues()
+            .queues_mut()
             .get_mut(self.queue_select as usize)
         {
             f(queue);
@@ -145,7 +145,7 @@ impl MmioTransport {
         //   notifications in those eventfds, but nothing will happen other
         //   than supurious wakeups.
         // . Do not reset config_generation and keep it monotonically increasing
-        for queue in self.locked_device().queues() {
+        for queue in self.locked_device().queues_mut() {
             *queue = Queue::new(queue.get_max_size());
         }
     }
@@ -405,7 +405,11 @@ mod tests {
             Ok(())
         }
 
-        fn queues(&mut self) -> &mut [Queue] {
+        fn queues(&self) -> &[Queue] {
+            &self.queues
+        }
+
+        fn queues_mut(&mut self) -> &mut [Queue] {
             &mut self.queues
         }
 

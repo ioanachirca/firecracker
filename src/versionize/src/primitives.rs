@@ -3,6 +3,8 @@
 #![allow(clippy::float_cmp)]
 
 use self::super::{Error, VersionMap, Versionize, VersionizeResult};
+use std::sync::atomic::AtomicUsize;
+use vm_memory::{Address, GuestAddress};
 use vmm_sys_util::fam::{FamStruct, FamStructWrapper};
 
 /// Implements the Versionize trait for primitive types that also implement
@@ -61,6 +63,37 @@ impl_versionize!(f32);
 impl_versionize!(f64);
 impl_versionize!(char);
 impl_versionize!(String);
+impl_versionize!(AtomicUsize);
+
+impl Versionize for GuestAddress {
+    #[inline]
+    fn serialize<W: std::io::Write>(
+        &self,
+        writer: &mut W,
+        version_map: &VersionMap,
+        app_version: u16,
+    ) -> VersionizeResult<()> {
+        self.0.serialize(writer, version_map, app_version)
+    }
+
+    #[inline]
+    fn deserialize<R: std::io::Read>(
+        reader: &mut R,
+        version_map: &VersionMap,
+        app_version: u16,
+    ) -> VersionizeResult<Self> {
+        Ok(GuestAddress::new(Versionize::deserialize(
+            reader,
+            version_map,
+            app_version,
+        )?))
+    }
+
+    // Not used yet.
+    fn version() -> u16 {
+        1
+    }
+}
 
 impl<T> Versionize for Box<T>
 where
