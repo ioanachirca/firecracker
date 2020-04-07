@@ -5,12 +5,16 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the THIRD-PARTY file.
 
-use std::sync::{atomic::AtomicUsize, Arc};
+use std::sync::{atomic::AtomicUsize, atomic::Ordering, Arc};
 
-use super::{ActivateResult, Queue};
+use super::{ActivateResult, Queue, QueueState};
 use crate::virtio::AsAny;
 use utils::eventfd::EventFd;
 use vm_memory::GuestMemoryMmap;
+
+use snapshot::Persist;
+use versionize::{VersionMap, Versionize, VersionizeResult};
+use versionize_derive::Versionize;
 
 /// Enum that indicates if a VirtioDevice is inactive or has been activated
 /// and memory attached to it.
@@ -107,5 +111,29 @@ pub trait VirtioDevice: AsAny + Send {
     /// event, and queue events.
     fn reset(&mut self) -> Option<(EventFd, Vec<EventFd>)> {
         None
+    }
+}
+
+/// State of a VirtioDevice.
+#[derive(Debug, PartialEq, Versionize)]
+pub struct VirtioDeviceState {
+    pub avail_features: u64,
+    pub acked_features: u64,
+    pub device_type: u32,
+    pub queues: Vec<QueueState>,
+    pub interrupt_status: usize,
+    pub activated: bool,
+}
+
+impl VirtioDeviceState {
+    pub fn from_device(device: &dyn VirtioDevice) -> Self {
+        VirtioDeviceState {
+            avail_features: device.avail_features(),
+            acked_features: device.acked_features(),
+            device_type: device.device_type(),
+            queues: device.queues().iter().map(Persist::save).collect(),
+            interrupt_status: device.interrupt_status().load(Ordering::Relaxed),
+            activated: device.is_activated(),
+        }
     }
 }

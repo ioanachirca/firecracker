@@ -338,6 +338,7 @@ mod tests {
 
     use super::*;
     use utils::eventfd::EventFd;
+    use versionize::{VersionMap, Versionize};
     use vm_memory::GuestMemoryMmap;
 
     struct DummyDevice {
@@ -434,6 +435,22 @@ mod tests {
         let mut buf = vec![0; 4];
         write_le_u32(&mut buf[..], status);
         d.write(0x70, &buf[..]);
+    }
+
+    #[test]
+    fn test_virtio_device_state_versionize() {
+        let dummy = DummyDevice::new();
+        let mut mem = vec![0; 4096];
+        let version_map = VersionMap::new();
+
+        let state = VirtioDeviceState::from_device(&dummy);
+        state
+            .serialize(&mut mem.as_mut_slice(), &version_map, 1)
+            .unwrap();
+
+        let restored_state =
+            VirtioDeviceState::deserialize(&mut mem.as_slice(), &version_map, 1).unwrap();
+        assert_eq!(restored_state, state);
     }
 
     #[test]
