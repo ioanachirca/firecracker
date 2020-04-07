@@ -7,21 +7,28 @@
 
 use std::cmp;
 use std::convert::From;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
 use std::os::linux::fs::MetadataExt;
+use std::path::PathBuf;
 use std::result;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use logger::{Metric, METRICS};
-use rate_limiter::{RateLimiter, TokenType};
+use rate_limiter::{RateLimiter, RateLimiterState, TokenType};
+use snapshot::Persist;
 use utils::eventfd::EventFd;
+use versionize::{VersionMap, Versionize, VersionizeResult};
+use versionize_derive::Versionize;
 use virtio_gen::virtio_blk::*;
 use vm_memory::{Bytes, GuestMemoryMmap};
 
 use super::{
-    super::{ActivateResult, DeviceState, Queue, VirtioDevice, TYPE_BLOCK, VIRTIO_MMIO_INT_VRING},
+    super::{
+        ActivateResult, DeviceState, Queue, VirtioDevice, VirtioDeviceState, TYPE_BLOCK,
+        VIRTIO_MMIO_INT_VRING,
+    },
     request::*,
     Error, CONFIG_SPACE_SIZE, QUEUE_SIZES, SECTOR_SHIFT, SECTOR_SIZE,
 };
@@ -81,6 +88,7 @@ fn build_disk_image_id(disk_image: &File) -> Vec<u8> {
 pub struct Block {
     // Host file and properties.
     disk_image: File,
+    disk_image_path: PathBuf,
     disk_nsectors: u64,
     disk_image_id: Vec<u8>,
 
@@ -110,12 +118,17 @@ impl Block {
     /// The given file must be seekable and sizable.
     pub fn new(
         id: String,
-        mut disk_image: File,
         partuuid: Option<String>,
+        disk_image_path: &PathBuf,
         is_disk_read_only: bool,
         is_disk_root: bool,
         rate_limiter: RateLimiter,
     ) -> io::Result<Block> {
+        let mut disk_image = OpenOptions::new()
+            .read(true)
+            .write(!is_disk_read_only)
+            .open(disk_image_path)?;
+
         let disk_size = disk_image.seek(SeekFrom::End(0))? as u64;
 
         let mut avail_features = (1u64 << VIRTIO_F_VERSION_1) | (1u64 << VIRTIO_BLK_F_FLUSH);
@@ -134,6 +147,7 @@ impl Block {
             partuuid,
             disk_image_id: build_disk_image_id(&disk_image),
             disk_image,
+            disk_image_path: disk_image_path.clone(),
             disk_nsectors: disk_size / SECTOR_SIZE,
             avail_features,
             acked_features: 0u64,
@@ -370,6 +384,70 @@ impl VirtioDevice for Block {
     }
 }
 
+#[derive(Versionize)]
+pub struct BlockState {
+    id: String,
+    partuuid: Option<String>,
+    root_device: bool,
+    disk_path: PathBuf,
+    virtio_state: VirtioDeviceState,
+    rate_limiter_state: RateLimiterState,
+}
+
+pub struct BlockConstructorArgs {
+    mem: GuestMemoryMmap,
+}
+
+impl Persist for Block {
+    type State = BlockState;
+    type ConstructorArgs = BlockConstructorArgs;
+    type Error = io::Error;
+
+    fn save(&self) -> Self::State {
+        BlockState {
+            id: self.id.clone(),
+            partuuid: self.partuuid.clone(),
+            root_device: self.root_device,
+            disk_path: self.disk_image_path.clone(),
+            virtio_state: VirtioDeviceState::from_device(self),
+            rate_limiter_state: self.rate_limiter.save(),
+        }
+    }
+
+    fn restore(
+        constructor_args: Self::ConstructorArgs,
+        state: &Self::State,
+    ) -> Result<Self, Self::Error> {
+        let is_disk_read_only = state.virtio_state.avail_features & (1u64 << VIRTIO_BLK_F_RO) != 0;
+        let rate_limiter = RateLimiter::restore((), &state.rate_limiter_state)?;
+
+        let mut block = Block::new(
+            state.id.clone(),
+            state.partuuid.clone(),
+            &state.disk_path,
+            is_disk_read_only,
+            state.root_device,
+            rate_limiter,
+        )?;
+
+        block.queues = state
+            .virtio_state
+            .queues
+            .iter()
+            .map(|queue_state| Queue::restore((), &queue_state).unwrap())
+            .collect();
+        block.interrupt_status = Arc::new(AtomicUsize::new(state.virtio_state.interrupt_status));
+        block.avail_features = state.virtio_state.avail_features;
+        block.acked_features = state.virtio_state.acked_features;
+
+        if state.virtio_state.activated {
+            block.device_state = DeviceState::Activated(constructor_args.mem);
+        }
+
+        Ok(block)
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use std::fs::metadata;
@@ -412,14 +490,22 @@ pub(crate) mod tests {
     pub fn default_block() -> Block {
         // Create backing file.
         let f = TempFile::new().unwrap();
-        let block_file = f.into_file();
-        block_file.set_len(0x1000).unwrap();
+        f.as_file().set_len(0x1000).unwrap();
 
         // Rate limiting is enabled but with a high operation rate (10 million ops/s).
         let rate_limiter = RateLimiter::new(0, None, 0, 100_000, None, 10).unwrap();
 
         let id = "test".to_string();
-        Block::new(id, block_file, None, true, false, rate_limiter).unwrap()
+        // The default block device is read-write and non-root.
+        Block::new(
+            id,
+            None,
+            &f.as_path().to_path_buf(),
+            false,
+            false,
+            rate_limiter,
+        )
+        .unwrap()
     }
 
     pub fn default_mem() -> GuestMemoryMmap {
@@ -480,8 +566,7 @@ pub(crate) mod tests {
 
         assert_eq!(block.device_type(), TYPE_BLOCK);
 
-        let features: u64 =
-            (1u64 << VIRTIO_BLK_F_RO) | (1u64 << VIRTIO_F_VERSION_1) | (1u64 << VIRTIO_BLK_F_FLUSH);
+        let features: u64 = (1u64 << VIRTIO_F_VERSION_1) | (1u64 << VIRTIO_BLK_F_FLUSH);
 
         assert_eq!(block.avail_features_by_page(0), features as u32);
         assert_eq!(block.avail_features_by_page(1), (features >> 32) as u32);
@@ -983,5 +1068,56 @@ pub(crate) mod tests {
             mdata.st_ino()
         );
         assert_eq!(block.disk_image_id, id);
+    }
+
+    #[test]
+    fn test_persistence() {
+        // We create the backing file here so that it exists for the whole lifetime of the test.
+        let f = TempFile::new().unwrap();
+        f.as_file().set_len(0x1000).unwrap();
+
+        let id = "test".to_string();
+        let mut block = Block::new(
+            id,
+            None,
+            &f.as_path().to_path_buf(),
+            false,
+            false,
+            RateLimiter::default(),
+        )
+        .unwrap();
+        let guest_mem = default_mem();
+        block.activate(guest_mem.clone()).unwrap();
+
+        // Save the block device.
+        let mut mem = vec![0; 4096];
+        let version_map = VersionMap::new();
+
+        <Block as Persist>::save(&block)
+            .serialize(&mut mem.as_mut_slice(), &version_map, 1)
+            .unwrap();
+
+        // Restore the block device.
+        let restored_block = Block::restore(
+            BlockConstructorArgs {
+                mem: guest_mem.clone(),
+            },
+            &BlockState::deserialize(&mut mem.as_slice(), &version_map, 1).unwrap(),
+        )
+        .unwrap();
+
+        // Test that virtio specific fields are the same.
+        assert_eq!(restored_block.device_type(), TYPE_BLOCK);
+        assert_eq!(restored_block.avail_features(), block.avail_features());
+        assert_eq!(restored_block.acked_features(), block.acked_features());
+        assert_eq!(restored_block.queues(), block.queues());
+        assert_eq!(
+            restored_block.interrupt_status().load(Ordering::Relaxed),
+            block.interrupt_status().load(Ordering::Relaxed)
+        );
+        assert_eq!(restored_block.is_activated(), block.is_activated());
+
+        // Test that block specific fields are the same.
+        assert_eq!(&restored_block.disk_image_path, &block.disk_image_path);
     }
 }
