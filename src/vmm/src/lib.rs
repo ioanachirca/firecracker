@@ -29,6 +29,7 @@ extern crate logger;
 extern crate dumbo;
 extern crate rate_limiter;
 extern crate seccomp;
+extern crate snapshot;
 extern crate utils;
 extern crate versionize;
 extern crate versionize_derive;
@@ -45,11 +46,14 @@ pub mod resources;
 pub mod rpc_interface;
 /// Signal handling utilities.
 pub mod signal_handler;
+// Save/restore utilities.
+pub mod persist;
 /// Wrappers over structures used to configure the VMM.
 pub mod vmm_config;
 mod vstate;
 
 use std::fmt::{Display, Formatter};
+use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::unix::io::AsRawFd;
 use std::sync::Mutex;
@@ -60,16 +64,27 @@ use arch::InitrdConfig;
 #[cfg(target_arch = "x86_64")]
 use device_manager::legacy::PortIODeviceManager;
 use device_manager::mmio::MMIODeviceManager;
+use devices::virtio::{
+    vsock::persist::VsockState, Block, MmioTransport, Net, Vsock, VsockUnixBackend, TYPE_BLOCK,
+    TYPE_NET, TYPE_VSOCK,
+};
 use devices::BusDevice;
 use kernel::cmdline::Cmdline as KernelCmdline;
 use logger::{LoggerError, MetricsError, METRICS};
+use persist::{
+    ConnectedBlockState, ConnectedNetState, ConnectedVsockState, DeviceStates, MicrovmState,
+    SaveMicrovmStateError, VmInfo, VmmResourcesState,
+};
 use polly::event_manager::{self, EventManager, Subscriber};
 use seccomp::{BpfProgram, BpfProgramRef, SeccompFilter};
+use snapshot::{Persist, Snapshot};
+use std::sync::mpsc::RecvTimeoutError;
 use utils::epoll::{EpollEvent, EventSet};
 use utils::eventfd::EventFd;
 use utils::time::TimestampUs;
+use versionize::VersionMap;
 use vm_memory::GuestMemoryMmap;
-use vstate::{Vcpu, VcpuEvent, VcpuHandle, VcpuResponse, Vm};
+use vstate::{Vcpu, VcpuEvent, VcpuHandle, VcpuResponse, VcpuState, Vm};
 
 /// Success exit code.
 pub const FC_EXIT_CODE_OK: u8 = 0;
@@ -220,7 +235,7 @@ pub struct Vmm {
 }
 
 impl Vmm {
-    /// Gets the the specified bus device.
+    /// Gets the specified bus device.
     pub fn get_bus_device(
         &self,
         device_type: DeviceType,
@@ -371,6 +386,150 @@ impl Vmm {
     /// Returns a reference to the inner KVM Vm object.
     pub fn kvm_vm(&self) -> &Vm {
         &self.vm
+    }
+
+    /// Saves the device states.
+    pub fn save_mmio_device_states(&mut self) -> DeviceStates {
+        let mut states = DeviceStates {
+            block_devices: Vec::new(),
+            net_devices: Vec::new(),
+            vsock_device: None,
+        };
+        let device_manager = &mut self.mmio_device_manager;
+
+        for ((device_type, device_id), device_info) in device_manager.get_device_info().iter() {
+            let bus_device = device_manager
+                .get_device(*device_type, device_id)
+                // Safe to unwrap() because we know the device exists.
+                .unwrap()
+                .lock()
+                .expect("Poisoned device lock");
+
+            let mmio_transport = bus_device
+                .as_any()
+                // Only MmioTransport implements BusDevice at this point.
+                .downcast_ref::<MmioTransport>()
+                .expect("Unexpected BusDevice type");
+
+            let transport_state = mmio_transport.save();
+            let vmm_resources = VmmResourcesState {
+                mmio_base: device_info.addr,
+                len: device_info.len,
+                irq: device_info.irq,
+            };
+
+            let locked_device = mmio_transport.locked_device();
+            match locked_device.device_type() {
+                TYPE_BLOCK => {
+                    let block_state = locked_device
+                        .as_any()
+                        .downcast_ref::<Block>()
+                        .unwrap()
+                        .save();
+                    states.block_devices.push(ConnectedBlockState {
+                        device_state: block_state,
+                        transport_state,
+                        vmm_resources,
+                    });
+                }
+                TYPE_NET => {
+                    let net_state = locked_device.as_any().downcast_ref::<Net>().unwrap().save();
+                    states.net_devices.push(ConnectedNetState {
+                        device_state: net_state,
+                        transport_state,
+                        vmm_resources,
+                    });
+                }
+                TYPE_VSOCK => {
+                    let vsock = locked_device
+                        .as_any()
+                        // Currently, VsockUnixBackend is the only implementation of VsockBackend.
+                        .downcast_ref::<Vsock<VsockUnixBackend>>()
+                        .unwrap();
+                    let vsock_state = VsockState {
+                        backend: vsock.backend().save(),
+                        frontend: vsock.save(),
+                    };
+                    states.vsock_device = Some(ConnectedVsockState {
+                        device_state: vsock_state,
+                        transport_state,
+                        vmm_resources,
+                    });
+                }
+                _ => unreachable!(),
+            };
+        }
+        states
+    }
+
+    /// TODO: remove pub
+    pub fn save(
+        &mut self,
+        snapshot_path: String,
+        _mem_file_path: String,
+        version_map: &VersionMap,
+        version: u16,
+        _is_diff_snapshot: bool,
+    ) -> std::result::Result<(), SaveMicrovmStateError> {
+        // Signal the Vcpus to save state.
+        for handle in self.vcpus_handles.iter() {
+            handle
+                .send_event(VcpuEvent::SaveState)
+                .map_err(SaveMicrovmStateError::SignalVcpu)?;
+        }
+
+        let vcpu_responses = self
+            .vcpus_handles
+            .iter()
+            // The nifty `Iterator::collect` can transform a `Vec<Result>` into a `Result<Vec>`.
+            .map(|handle| {
+                handle
+                    .response_receiver()
+                    .recv_timeout(Duration::from_millis(400))
+            })
+            .collect::<std::result::Result<Vec<VcpuResponse>, RecvTimeoutError>>()
+            .map_err(|_| SaveMicrovmStateError::SaveVcpuState(None))?;
+
+        let vcpu_states = vcpu_responses
+            .into_iter()
+            .map(|response| match response {
+                VcpuResponse::SaveState(state) => Ok(state),
+                VcpuResponse::SaveStateFailed(err) => {
+                    Err(SaveMicrovmStateError::SaveVcpuState(Some(err)))
+                }
+                _ => Err(SaveMicrovmStateError::SaveVcpuState(None)),
+            })
+            .collect::<std::result::Result<Vec<VcpuState>, SaveMicrovmStateError>>()?;
+
+        let vm_state = self
+            .vm
+            .save_state()
+            .map_err(SaveMicrovmStateError::SaveVmState)?;
+
+        let device_states = self.save_mmio_device_states();
+
+        // TODO: Save guest memory to `mem_file_path`.
+
+        let microvm_state = MicrovmState {
+            vm_info: VmInfo { mem_size_mib: 1u64 },
+            vm_state,
+            vcpu_states,
+            device_states,
+        };
+
+        let mut snapshot_file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(snapshot_path)
+            .map_err(SaveMicrovmStateError::SnapshotBackingFile)?;
+
+        let mut snapshot = Snapshot::new(version_map.clone(), version);
+        snapshot
+            .write_section("microvm_state", &microvm_state)
+            .map_err(SaveMicrovmStateError::SerializeMicrovmState)?;
+        snapshot.save(&mut snapshot_file).map_err(SaveMicrovmStateError::SerializeMicrovmState)?;
+
+        Ok(())
     }
 }
 
