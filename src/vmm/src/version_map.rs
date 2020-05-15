@@ -17,9 +17,9 @@ lazy_static! {
 
     /// Static instance used for mapping Firecracker release version to
     /// snapshot data format version.
-    pub static ref FC_VERSION_TO_SNAP_VERSION: HashMap<u16, u16> = {
+    pub static ref FC_VERSION_TO_SNAP_VERSION: HashMap<String, u16> = {
         let mut hm = HashMap::new();
-        hm.insert(23, 1);
+        hm.insert(String::from("0.23.0"), 1);
 
         hm
     };

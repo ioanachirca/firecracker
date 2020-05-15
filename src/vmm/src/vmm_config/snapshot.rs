@@ -35,7 +35,7 @@ pub struct CreateSnapshotParams {
     pub mem_file_path: PathBuf,
     ///  Optional field for the snapshot format version. The default
     /// value is the current app version.
-    pub version: Option<u16>,
+    pub version: Option<String>,
 }
 
 /// Stores the configuration that will be used for loading a snapshot.
