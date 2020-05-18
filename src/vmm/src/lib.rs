@@ -74,11 +74,9 @@ use devices::BusDevice;
 use logger::{LoggerError, MetricsError, METRICS};
 
 #[cfg(target_arch = "x86_64")]
-use persist::{MicrovmState, SaveMicrovmStateError, VmInfo};
+use persist::SaveVcpuStateError;
 use polly::event_manager::{self, EventManager, Subscriber};
 use seccomp::{BpfProgram, BpfProgramRef, SeccompFilter};
-#[cfg(target_arch = "x86_64")]
-use snapshot::Persist;
 use utils::epoll::{EpollEvent, EventSet};
 use utils::eventfd::EventFd;
 use utils::time::TimestampUs;
@@ -381,37 +379,12 @@ impl Vmm {
         &self.vm
     }
 
-    /// Saves the state of a paused Microvm.
     #[cfg(target_arch = "x86_64")]
-    pub fn save_state(&mut self) -> std::result::Result<MicrovmState, SaveMicrovmStateError> {
-        let vcpu_states = self.save_vcpu_states()?;
-
-        let vm_state = self
-            .vm
-            .save_state()
-            .map_err(SaveMicrovmStateError::InvalidVmState)?;
-
-        let device_states = self.mmio_device_manager.save();
-
-        let mem_size_mib =
-            self.guest_memory()
-                .map_and_fold(0, |(_, region)| region.len(), |a, b| a + b)
-                >> 20;
-
-        Ok(MicrovmState {
-            vm_info: VmInfo { mem_size_mib },
-            vm_state,
-            vcpu_states,
-            device_states,
-        })
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    fn save_vcpu_states(&mut self) -> std::result::Result<Vec<VcpuState>, SaveMicrovmStateError> {
+    fn save_vcpu_states(&mut self) -> std::result::Result<Vec<VcpuState>, SaveVcpuStateError> {
         for handle in self.vcpus_handles.iter() {
             handle
                 .send_event(VcpuEvent::SaveState)
-                .map_err(SaveMicrovmStateError::SignalVcpu)?;
+                .map_err(SaveVcpuStateError::SignalVcpu)?;
         }
 
         let vcpu_responses = self
@@ -424,16 +397,16 @@ impl Vmm {
                     .recv_timeout(Duration::from_millis(400))
             })
             .collect::<std::result::Result<Vec<VcpuResponse>, RecvTimeoutError>>()
-            .map_err(|_| SaveMicrovmStateError::InvalidVcpuState)?;
+            .map_err(|_| SaveVcpuStateError::InvalidVcpuState)?;
 
         let vcpu_states = vcpu_responses
             .into_iter()
             .map(|response| match response {
                 VcpuResponse::SaveState(state) => Ok(*state),
-                VcpuResponse::SaveStateFailed(_) => Err(SaveMicrovmStateError::InvalidVcpuState),
-                _ => Err(SaveMicrovmStateError::InvalidVcpuState),
+                VcpuResponse::SaveStateFailed(_) => Err(SaveVcpuStateError::InvalidVcpuState),
+                _ => Err(SaveVcpuStateError::InvalidVcpuState),
             })
-            .collect::<std::result::Result<Vec<VcpuState>, SaveMicrovmStateError>>()?;
+            .collect::<std::result::Result<Vec<VcpuState>, SaveVcpuStateError>>()?;
 
         Ok(vcpu_states)
     }

@@ -12,12 +12,12 @@ use std::path::PathBuf;
 
 use device_manager::persist::DeviceStates;
 use memory_dump;
-use memory_dump::DumpMemory;
-use snapshot::Snapshot;
+use memory_dump::{DumpMemory, GuestMemoryState};
+use snapshot::{Persist, Snapshot};
 use version_map::FC_VERSION_TO_SNAP_VERSION;
 use versionize::{VersionMap, Versionize, VersionizeResult};
 use versionize_derive::Versionize;
-use vm_memory::{GuestMemory, GuestMemoryRegion};
+use vm_memory::{GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
 use vmm_config::snapshot::{CreateSnapshotParams, SnapshotType};
 use vstate;
 use vstate::{VcpuState, VmState};
@@ -34,33 +34,32 @@ pub struct VmInfo {
 /// Contains the necesary state for saving/restoring a microVM.
 #[derive(Versionize)]
 pub struct MicrovmState {
+    /// Device states.
+    pub device_states: DeviceStates,
+    /// Memory state.
+    pub memory_state: GuestMemoryState,
+    /// Vcpu states.
+    pub vcpu_states: Vec<VcpuState>,
     /// Miscellaneous VM info.
     pub vm_info: VmInfo,
     /// VM KVM state.
     pub vm_state: VmState,
-    /// Vcpu states.
-    pub vcpu_states: Vec<VcpuState>,
-    /// Device states.
-    pub device_states: DeviceStates,
 }
 
-/// Errors related to saving Microvm state.
+/// Errors associated with saving vcpu states.
 #[derive(Debug)]
-pub enum SaveMicrovmStateError {
+pub enum SaveVcpuStateError {
     /// Failed to save vCPU state.
     InvalidVcpuState,
-    /// Failed to save VM state.
-    InvalidVmState(vstate::Error),
     /// Failed to send event.
     SignalVcpu(vstate::Error),
 }
 
-impl Display for SaveMicrovmStateError {
+impl Display for SaveVcpuStateError {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
-        use self::SaveMicrovmStateError::*;
+        use self::SaveVcpuStateError::*;
         match self {
-            InvalidVcpuState => write!(f, "Unable to save Vcpu state."),
-            InvalidVmState(err) => write!(f, "Unable to save Vm state. Error: {:?}", err),
+            InvalidVcpuState => write!(f, "Invalid Vcpu state."),
             SignalVcpu(err) => write!(f, "Unable to signal Vcpu: {:?}", err),
         }
     }
@@ -73,12 +72,14 @@ pub enum CreateSnapshotError {
     DirtyBitmap,
     /// Failed to translate microVM version to snapshot data version.
     InvalidVersion,
+    /// Failed to save VM state.
+    InvalidVmState(vstate::Error),
     /// Failed to write memory to snapshot.
     Memory(memory_dump::Error),
     /// Failed to open memory backing file.
     MemoryBackingFile(std::io::Error),
-    /// Failed to save MicrovmState.
-    MicrovmState(SaveMicrovmStateError),
+    /// Failed to save Vcpu state.
+    VcpuState(SaveVcpuStateError),
     /// Failed to serialize microVM state.
     SerializeMicrovmState(snapshot::Error),
     /// Failed to open the snapshot backing file.
@@ -94,9 +95,10 @@ impl Display for CreateSnapshotError {
                 f,
                 "Unable to translate microVM version to snapshot data version"
             ),
+            InvalidVmState(err) => write!(f, "Unable to save Vm state. Error: {:?}", err),
             Memory(err) => write!(f, "Unable to write memory file: {:?}", err),
             MemoryBackingFile(err) => write!(f, "Unable to open memory file: {:?}", err),
-            MicrovmState(err) => write!(f, "Unable to save microvm state: {}", err),
+            VcpuState(err) => write!(f, "Unable to save vcpu state: {}", err),
             SerializeMicrovmState(err) => write!(f, "Unable to serialize MicrovmState: {:?}", err),
             SnapshotBackingFile(err) => write!(f, "Unable to open snapshot file: {:?}", err),
         }
@@ -109,11 +111,27 @@ pub fn create_snapshot(
     params: CreateSnapshotParams,
     version_map: VersionMap,
 ) -> std::result::Result<(), CreateSnapshotError> {
-    let microvm_state = vmm
-        .save_state()
-        .map_err(CreateSnapshotError::MicrovmState)?;
+    let vcpu_states = vmm
+        .save_vcpu_states()
+        .map_err(CreateSnapshotError::VcpuState)?;
 
-    snapshot_memory_to_file(vmm, &params.mem_file_path, params.snapshot_type)?;
+    let vm_state = vmm
+        .vm
+        .save_state()
+        .map_err(CreateSnapshotError::InvalidVmState)?;
+
+    let device_states = vmm.mmio_device_manager.save();
+
+    let memory_state = snapshot_memory_to_file(vmm, &params.mem_file_path, params.snapshot_type)?;
+
+    let mem_size_mib = mem_size_mib(vmm.guest_memory());
+    let microvm_state = MicrovmState {
+        device_states,
+        memory_state,
+        vm_info: VmInfo { mem_size_mib },
+        vcpu_states,
+        vm_state,
+    };
 
     snapshot_state_to_file(
         &microvm_state,
@@ -158,7 +176,7 @@ fn snapshot_memory_to_file(
     vmm: &Vmm,
     mem_file_path: &PathBuf,
     snapshot_type: SnapshotType,
-) -> std::result::Result<(), CreateSnapshotError> {
+) -> std::result::Result<GuestMemoryState, CreateSnapshotError> {
     let mut file = OpenOptions::new()
         .write(true)
         .create(true)
@@ -167,15 +185,11 @@ fn snapshot_memory_to_file(
         .map_err(CreateSnapshotError::MemoryBackingFile)?;
 
     // Set the length of the file to the full size of the memory area.
-    let mem_size_mib = vmm
-        .guest_memory()
-        .map_and_fold(0, |(_, region)| region.len(), |a, b| a + b)
-        >> 20;
-
+    let mem_size_mib = mem_size_mib(vmm.guest_memory());
     file.set_len((mem_size_mib * 1024 * 1024) as u64)
         .map_err(CreateSnapshotError::MemoryBackingFile)?;
 
-    match snapshot_type {
+    let guest_memory_state = match snapshot_type {
         SnapshotType::Diff => {
             let dirty_bitmap = vmm
                 .get_dirty_bitmap()
@@ -188,9 +202,13 @@ fn snapshot_memory_to_file(
             .guest_memory()
             .dump(&mut file)
             .map_err(CreateSnapshotError::Memory)?,
-    }
+    };
 
-    Ok(())
+    Ok(guest_memory_state)
+}
+
+fn mem_size_mib(guest_memory: &GuestMemoryMmap) -> u64 {
+    guest_memory.map_and_fold(0, |(_, region)| region.len(), |a, b| a + b) >> 20
 }
 
 #[cfg(test)]
@@ -249,11 +267,15 @@ mod tests {
         assert_eq!(states.net_devices.len(), 1);
         assert!(states.vsock_device.is_some());
 
+        let mut buffer = vec![0u8; 1000];
+        let memory_state = vmm.guest_memory().dump(&mut buffer.as_mut_slice()).unwrap();
+
         let microvm_state = MicrovmState {
+            device_states: states,
+            memory_state,
+            vcpu_states: vec![default_vcpu_state()],
             vm_info: VmInfo { mem_size_mib: 1u64 },
             vm_state: vmm.vm.save_state().unwrap(),
-            vcpu_states: vec![default_vcpu_state()],
-            device_states: states,
         };
 
         let mut buf = vec![0; 10000];
@@ -284,6 +306,9 @@ mod tests {
         let err = InvalidVersion;
         let _ = format!("{}{:?}", err, err);
 
+        let err = InvalidVmState(vstate::Error::NotEnoughMemorySlots);
+        let _ = format!("{}{:?}", err, err);
+
         let err = Memory(memory_dump::Error::WriteMemory(
             GuestMemoryError::HostAddressNotAvailable,
         ));
@@ -292,24 +317,21 @@ mod tests {
         let err = MemoryBackingFile(std::io::Error::from_raw_os_error(0));
         let _ = format!("{}{:?}", err, err);
 
-        let err = MicrovmState(SaveMicrovmStateError::InvalidVcpuState);
-        let _ = format!("{}{:?}", err, err);
-
         let err = SerializeMicrovmState(snapshot::Error::InvalidMagic(0));
         let _ = format!("{}{:?}", err, err);
 
         let err = SnapshotBackingFile(std::io::Error::from_raw_os_error(0));
         let _ = format!("{}{:?}", err, err);
+
+        let err = VcpuState(SaveVcpuStateError::InvalidVcpuState);
+        let _ = format!("{}{:?}", err, err);
     }
 
     #[test]
-    fn test_save_microvm_state_error_messages() {
-        use persist::SaveMicrovmStateError::*;
+    fn test_save_vcpu_state_error_messages() {
+        use persist::SaveVcpuStateError::*;
 
         let err = InvalidVcpuState;
-        let _ = format!("{}{:?}", err, err);
-
-        let err = InvalidVmState(vstate::Error::NotEnoughMemorySlots);
         let _ = format!("{}{:?}", err, err);
 
         let err = SignalVcpu(vstate::Error::VcpuCountNotInitialized);
