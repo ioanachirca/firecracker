@@ -4,12 +4,14 @@
 //! Defines functionality for creating guest memory snapshots.
 
 use std::fmt::{Display, Formatter};
+use std::fs::File;
 use std::io::SeekFrom;
 
 use versionize::{VersionMap, Versionize, VersionizeResult};
 use versionize_derive::Versionize;
 use vm_memory::{
-    Bytes, GuestMemory, GuestMemoryError, GuestMemoryMmap, GuestMemoryRegion, MemoryRegionAddress,
+    Bytes, FileOffset, GuestAddress, GuestMemory, GuestMemoryError, GuestMemoryMmap,
+    GuestMemoryRegion, MemoryRegionAddress,
 };
 
 use crate::DirtyBitmap;
@@ -32,17 +34,29 @@ pub struct GuestMemoryState {
     pub regions: Vec<GuestMemoryRegionState>,
 }
 
-/// Defines the interface for dumping memory a file.
-pub trait DumpMemory {
-    fn dump<T: std::io::Write>(
-        &self,
-        writer: &mut T,
-    ) -> std::result::Result<GuestMemoryState, Error>;
+/// Defines the interface for snapshotting memory.
+pub trait SnapshotMemory
+where
+    Self: Sized,
+{
+    type State;
+
+    fn dump<T: std::io::Write>(&self, writer: &mut T) -> std::result::Result<Self::State, Error>;
+
     fn dump_dirty<T: std::io::Write + std::io::Seek>(
         &self,
         writer: &mut T,
         dirty_bitmap: &DirtyBitmap,
-    ) -> std::result::Result<GuestMemoryState, Error>;
+    ) -> std::result::Result<Self::State, Error>;
+
+    fn restore(file: &File, state: &Self::State) -> std::result::Result<Self, RestoreError>;
+}
+
+/// Errors associated with restoring guest memory from file.
+#[derive(Debug)]
+pub enum RestoreError {
+    FileHandle(std::io::Error),
+    Memory(vm_memory::Error),
 }
 
 /// Errors associated with dumping guest memory to file.
@@ -60,11 +74,10 @@ impl Display for Error {
     }
 }
 
-impl DumpMemory for GuestMemoryMmap {
-    fn dump<T: std::io::Write>(
-        &self,
-        writer: &mut T,
-    ) -> std::result::Result<GuestMemoryState, Error> {
+impl SnapshotMemory for GuestMemoryMmap {
+    type State = GuestMemoryState;
+
+    fn dump<T: std::io::Write>(&self, writer: &mut T) -> std::result::Result<Self::State, Error> {
         let mut guest_memory_state = GuestMemoryState {
             regions: Vec::new(),
         };
@@ -92,7 +105,7 @@ impl DumpMemory for GuestMemoryMmap {
         &self,
         writer: &mut T,
         dirty_bitmap: &DirtyBitmap,
-    ) -> std::result::Result<GuestMemoryState, Error> {
+    ) -> std::result::Result<Self::State, Error> {
         let page_size = sysconf::page::pagesize();
         let mut guest_memory_state = GuestMemoryState {
             regions: Vec::new(),
@@ -146,6 +159,25 @@ impl DumpMemory for GuestMemoryMmap {
         .map_err(Error::WriteMemory)?;
 
         Ok(guest_memory_state)
+    }
+
+    fn restore(file: &File, state: &Self::State) -> std::result::Result<Self, RestoreError> {
+        let mut ranges = Vec::new();
+        for region in state.regions.iter() {
+            ranges.push((
+                GuestAddress(region.base_address),
+                region.size,
+                Some(FileOffset::new(
+                    file.try_clone().map_err(RestoreError::FileHandle)?,
+                    region.offset,
+                )),
+            ));
+        }
+
+        Ok(
+            GuestMemoryMmap::from_ranges_with_files(&ranges.as_slice()[..])
+                .map_err(RestoreError::Memory)?,
+        )
     }
 }
 
@@ -223,5 +255,31 @@ mod tests {
             .dump_dirty(&mut file.as_file(), &dirty_bitmap)
             .unwrap();
         assert_eq!(expected_memory_state, actual_memory_state);
+    }
+
+    #[test]
+    fn test_restore_memory() {
+        let page_size: usize = sysconf::page::pagesize();
+        // Two regions of three pages each, with a one page gap between them.
+        let mem_regions = [
+            (GuestAddress(0), page_size * 3),
+            (GuestAddress(page_size as u64 * 4), page_size * 3),
+        ];
+        let guest_memory = GuestMemoryMmap::from_ranges(&mem_regions[..]).unwrap();
+        let expected_info: [u8; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
+        guest_memory
+            .write(&expected_info[..], GuestAddress(0))
+            .unwrap();
+
+        let file = TempFile::new().unwrap();
+        let memory_state = guest_memory.dump(&mut file.as_file()).unwrap();
+
+        let restored_guest_memory =
+            GuestMemoryMmap::restore(&file.as_file(), &memory_state).unwrap();
+        let mut actual_info = [0u8; 8];
+        restored_guest_memory
+            .read(&mut actual_info, GuestAddress(0))
+            .unwrap();
+        assert_eq!(expected_info, actual_info);
     }
 }

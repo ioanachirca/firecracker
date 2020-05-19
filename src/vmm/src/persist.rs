@@ -12,7 +12,7 @@ use std::path::PathBuf;
 
 use device_manager::persist::DeviceStates;
 use memory_dump;
-use memory_dump::{DumpMemory, GuestMemoryState};
+use memory_dump::{GuestMemoryState, SnapshotMemory};
 use snapshot::{Persist, Snapshot};
 use version_map::FC_VERSION_TO_SNAP_VERSION;
 use versionize::{VersionMap, Versionize, VersionizeResult};
