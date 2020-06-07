@@ -17,6 +17,9 @@ mod mock_seccomp;
 mod test_utils;
 
 use std::io;
+#[cfg(target_arch = "x86_64")]
+use std::io::{Seek, SeekFrom};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -24,7 +27,9 @@ use polly::event_manager::EventManager;
 use seccomp::{BpfProgram, SeccompLevel};
 #[cfg(target_arch = "x86_64")]
 use snapshot::Snapshot;
-use vmm::builder::{build_microvm, setup_serial_device};
+#[cfg(target_arch = "x86_64")]
+use vmm::builder::build_microvm_from_snapshot;
+use vmm::builder::{build_microvm_for_boot, setup_serial_device};
 use vmm::default_syscalls::get_seccomp_filter;
 #[cfg(target_arch = "x86_64")]
 use vmm::persist;
@@ -36,6 +41,7 @@ use vmm::version_map::VERSION_MAP;
 use vmm::vmm_config::boot_source::BootSourceConfig;
 #[cfg(target_arch = "x86_64")]
 use vmm::vmm_config::snapshot::{CreateSnapshotParams, SnapshotType};
+use vmm::Vmm;
 use vmm_sys_util::tempfile::TempFile;
 
 use mock_devices::MockSerialInput;
@@ -44,6 +50,39 @@ use mock_resources::NOISY_KERNEL_IMAGE;
 use mock_resources::{MockBootSourceConfig, MockVmResources};
 use mock_seccomp::MockSeccomp;
 use test_utils::{restore_stdin, set_panic_hook};
+
+fn default_vmm(_kernel_image: Option<&str>) -> (Arc<Mutex<Vmm>>, EventManager) {
+    let mut event_manager = EventManager::new().unwrap();
+    let empty_seccomp_filter = get_seccomp_filter(SeccompLevel::None).unwrap();
+
+    let boot_source_cfg = MockBootSourceConfig::new().with_default_boot_args();
+    #[cfg(target_arch = "aarch64")]
+    let boot_source_cfg: BootSourceConfig = boot_source_cfg.into();
+    #[cfg(target_arch = "x86_64")]
+    let boot_source_cfg: BootSourceConfig = match _kernel_image {
+        Some(kernel) => boot_source_cfg.with_kernel(kernel).into(),
+        None => boot_source_cfg.into(),
+    };
+    let resources: VmResources = MockVmResources::new()
+        .with_boot_source(boot_source_cfg)
+        .into();
+
+    (
+        build_microvm_for_boot(&resources, &mut event_manager, &empty_seccomp_filter).unwrap(),
+        event_manager,
+    )
+}
+
+fn wait_vmm_child_process(vmm_pid: i32) {
+    // Parent process: wait for the vmm to exit.
+    let mut vmm_status: i32 = -1;
+    let pid_done = unsafe { libc::waitpid(vmm_pid, &mut vmm_status, 0) };
+    assert_eq!(pid_done, vmm_pid);
+    restore_stdin();
+    // If any panics occurred, its exit status will be != 0.
+    assert!(unsafe { libc::WIFEXITED(vmm_status) });
+    assert_eq!(unsafe { libc::WEXITSTATUS(vmm_status) }, 0);
+}
 
 #[test]
 fn test_setup_serial_device() {
@@ -62,12 +101,14 @@ fn test_setup_serial_device() {
 #[test]
 fn test_build_microvm() {
     // Error case: no boot source configured.
-    let resources: VmResources = MockVmResources::new().into();
-    let mut event_manager = EventManager::new().unwrap();
-    let empty_seccomp_filter = get_seccomp_filter(SeccompLevel::None).unwrap();
+    {
+        let resources: VmResources = MockVmResources::new().into();
+        let mut event_manager = EventManager::new().unwrap();
+        let empty_seccomp_filter = get_seccomp_filter(SeccompLevel::None).unwrap();
 
-    let vmm_ret = build_microvm(&resources, &mut event_manager, &empty_seccomp_filter);
-    assert_eq!(format!("{:?}", vmm_ret.err()), "Some(MissingKernelConfig)");
+        let vmm_ret = build_microvm_for_boot(&resources, &mut event_manager, &empty_seccomp_filter);
+        assert_eq!(format!("{:?}", vmm_ret.err()), "Some(MissingKernelConfig)");
+    }
 
     // Success case.
     // Child process will run the vmm and exit.
@@ -80,15 +121,7 @@ fn test_build_microvm() {
             // Force the child to exit on panic to unblock the waiting parent.
             set_panic_hook();
 
-            let boot_source_cfg: BootSourceConfig =
-                MockBootSourceConfig::new().with_default_boot_args().into();
-            let resources: VmResources = MockVmResources::new()
-                .with_boot_source(boot_source_cfg)
-                .into();
-            let mut event_manager = EventManager::new().unwrap();
-            let empty_seccomp_filter = get_seccomp_filter(SeccompLevel::None).unwrap();
-
-            let vmm = build_microvm(&resources, &mut event_manager, &empty_seccomp_filter).unwrap();
+            let (vmm, mut event_manager) = default_vmm(None);
 
             // On x86_64, the vmm should exit once its workload completes and signals the exit event.
             // On aarch64, the test kernel doesn't exit, so the vmm is force-stopped.
@@ -101,13 +134,7 @@ fn test_build_microvm() {
         }
         vmm_pid => {
             // Parent process: wait for the vmm to exit.
-            let mut vmm_status: i32 = -1;
-            let pid_done = unsafe { libc::waitpid(vmm_pid, &mut vmm_status, 0) };
-            assert_eq!(pid_done, vmm_pid);
-            restore_stdin();
-            // If any panics occurred, its exit status will be != 0.
-            assert!(unsafe { libc::WIFEXITED(vmm_status) });
-            assert_eq!(unsafe { libc::WEXITSTATUS(vmm_status) }, 0);
+            wait_vmm_child_process(vmm_pid);
         }
     }
 }
@@ -128,7 +155,7 @@ fn test_vmm_seccomp() {
 
             // The customer "forgot" to whitelist the KVM_RUN ioctl.
             let filter: BpfProgram = MockSeccomp::new().without_kvm_run().into();
-            let vmm = build_microvm(&resources, &mut event_manager, &filter).unwrap();
+            let vmm = build_microvm_for_boot(&resources, &mut event_manager, &filter).unwrap();
             // Give the vCPUs a chance to attempt KVM_RUN.
             thread::sleep(Duration::from_millis(200));
             // Should never get here.
@@ -156,16 +183,10 @@ fn test_pause_resume_microvm() {
             // Child process: build and run vmm, then attempts to pause and resume it.
             set_panic_hook();
 
-            let boot_source_cfg: BootSourceConfig =
-                MockBootSourceConfig::new().with_default_boot_args().into();
-            let resources: VmResources = MockVmResources::new()
-                .with_boot_source(boot_source_cfg)
-                .into();
-            let mut event_manager = EventManager::new().unwrap();
-            let empty_seccomp_filter = get_seccomp_filter(SeccompLevel::None).unwrap();
+            let (vmm, mut event_manager) = default_vmm(None);
 
-            let vmm = build_microvm(&resources, &mut event_manager, &empty_seccomp_filter).unwrap();
-
+            // There's a race between this thread and the vcpu thread, but this thread
+            // should be able to pause vcpu thread before it finishes running its test-binary.
             assert!(vmm.lock().unwrap().pause_vcpus().is_ok());
             // Pausing again the microVM should not fail (microVM remains in the
             // `Paused` state).
@@ -181,13 +202,7 @@ fn test_pause_resume_microvm() {
         }
         vmm_pid => {
             // Parent process: wait for the vmm to exit.
-            let mut vmm_status: i32 = -1;
-            let pid_done = unsafe { libc::waitpid(vmm_pid, &mut vmm_status, 0) };
-            assert_eq!(pid_done, vmm_pid);
-            restore_stdin();
-            // If any panics occurred, its exit status will be != 0.
-            assert!(unsafe { libc::WIFEXITED(vmm_status) });
-            assert_eq!(unsafe { libc::WEXITSTATUS(vmm_status) }, 0);
+            wait_vmm_child_process(vmm_pid);
         }
     }
 }
@@ -199,15 +214,9 @@ fn test_dirty_bitmap_error() {
     match pid {
         0 => {
             set_panic_hook();
-            let boot_source_cfg: BootSourceConfig =
-                MockBootSourceConfig::new().with_default_boot_args().into();
-            let resources: VmResources = MockVmResources::new()
-                .with_boot_source(boot_source_cfg)
-                .into();
-            let mut event_manager = EventManager::new().unwrap();
-            let empty_seccomp_filter = get_seccomp_filter(SeccompLevel::None).unwrap();
 
-            let vmm = build_microvm(&resources, &mut event_manager, &empty_seccomp_filter).unwrap();
+            let (vmm, mut event_manager) = default_vmm(None);
+
             // The vmm will start with dirty page tracking = OFF.
             // With dirty tracking disabled, the underlying KVM_GET_DIRTY_LOG ioctl will fail
             // with errno 2 (ENOENT) because KVM can't find any guest memory regions with dirty
@@ -226,13 +235,7 @@ fn test_dirty_bitmap_error() {
         }
         vmm_pid => {
             // Parent process: wait for the vmm to exit.
-            let mut vmm_status: i32 = -1;
-            let pid_done = unsafe { libc::waitpid(vmm_pid, &mut vmm_status, 0) };
-            assert_eq!(pid_done, vmm_pid);
-            restore_stdin();
-            // If any panics occurred, its exit status will be != 0.
-            assert!(unsafe { libc::WIFEXITED(vmm_status) });
-            assert_eq!(unsafe { libc::WEXITSTATUS(vmm_status) }, 0);
+            wait_vmm_child_process(vmm_pid);
         }
     }
 }
@@ -246,18 +249,10 @@ fn test_dirty_bitmap_success() {
     match pid {
         0 => {
             set_panic_hook();
-            let boot_source_cfg: BootSourceConfig = MockBootSourceConfig::new()
-                .with_default_boot_args()
-                .with_kernel(NOISY_KERNEL_IMAGE)
-                .into();
-            let resources: VmResources = MockVmResources::new()
-                .with_boot_source(boot_source_cfg)
-                .into();
-            let mut event_manager = EventManager::new().unwrap();
-            let empty_seccomp_filter = get_seccomp_filter(SeccompLevel::None).unwrap();
 
             // The vmm will start with dirty page tracking = OFF.
-            let vmm = build_microvm(&resources, &mut event_manager, &empty_seccomp_filter).unwrap();
+            let (vmm, _) = default_vmm(Some(NOISY_KERNEL_IMAGE));
+
             assert!(vmm.lock().unwrap().set_dirty_page_tracking(true).is_ok());
             // Let it churn for a while and dirty some pages...
             thread::sleep(Duration::from_millis(100));
@@ -276,19 +271,13 @@ fn test_dirty_bitmap_success() {
         }
         vmm_pid => {
             // Parent process: wait for the vmm to exit.
-            let mut vmm_status: i32 = -1;
-            let pid_done = unsafe { libc::waitpid(vmm_pid, &mut vmm_status, 0) };
-            assert_eq!(pid_done, vmm_pid);
-            restore_stdin();
-            // If any panics occurred, its exit status will be != 0.
-            assert!(unsafe { libc::WIFEXITED(vmm_status) });
-            assert_eq!(unsafe { libc::WEXITSTATUS(vmm_status) }, 0);
+            wait_vmm_child_process(vmm_pid);
         }
     }
 }
 
 #[cfg(target_arch = "x86_64")]
-fn create_snapshot(is_diff: bool) {
+fn verify_create_snapshot(is_diff: bool) -> (TempFile, TempFile) {
     let snapshot_file = TempFile::new().unwrap();
     let memory_file = TempFile::new().unwrap();
 
@@ -296,17 +285,8 @@ fn create_snapshot(is_diff: bool) {
     match pid {
         0 => {
             set_panic_hook();
-            let boot_source_cfg: BootSourceConfig = MockBootSourceConfig::new()
-                .with_default_boot_args()
-                .with_kernel(NOISY_KERNEL_IMAGE)
-                .into();
-            let resources: VmResources = MockVmResources::new()
-                .with_boot_source(boot_source_cfg)
-                .into();
-            let mut event_manager = EventManager::new().unwrap();
-            let empty_seccomp_filter = get_seccomp_filter(SeccompLevel::None).unwrap();
 
-            let vmm = build_microvm(&resources, &mut event_manager, &empty_seccomp_filter).unwrap();
+            let (vmm, _) = default_vmm(Some(NOISY_KERNEL_IMAGE));
             assert!(vmm.lock().unwrap().set_dirty_page_tracking(true).is_ok());
 
             // Be sure that the microVM is running.
@@ -337,38 +317,84 @@ fn create_snapshot(is_diff: bool) {
         }
         vmm_pid => {
             // Parent process: wait for the vmm to exit.
-            let mut vmm_status: i32 = -1;
-            let pid_done = unsafe { libc::waitpid(vmm_pid, &mut vmm_status, 0) };
-            assert_eq!(pid_done, vmm_pid);
-            restore_stdin();
-            // If any panics occurred, its exit status will be != 0.
-            assert!(unsafe { libc::WIFEXITED(vmm_status) });
-            assert_eq!(unsafe { libc::WEXITSTATUS(vmm_status) }, 0);
+            wait_vmm_child_process(vmm_pid);
 
             // Check that we can deserialize the microVM state from `snapshot_file`.
             let restored_microvm_state: MicrovmState =
                 Snapshot::load(&mut snapshot_file.as_file(), VERSION_MAP.clone()).unwrap();
 
+            // Check memory file size.
             let memory_file_size_mib = memory_file.as_file().metadata().unwrap().len() >> 20;
             assert_eq!(
                 restored_microvm_state.vm_info.mem_size_mib,
                 memory_file_size_mib
             );
 
-            // The microVM had no devices and one vCPU.
+            // Verify deserialized data.
+            // The default vmm has no devices and one vCPU.
             assert_eq!(restored_microvm_state.device_states.block_devices.len(), 0);
             assert_eq!(restored_microvm_state.device_states.net_devices.len(), 0);
             assert!(restored_microvm_state.device_states.vsock_device.is_none());
             assert_eq!(restored_microvm_state.vcpu_states.len(), 1);
         }
     }
+    (snapshot_file, memory_file)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn verify_load_snapshot(snapshot_file: TempFile, memory_file: TempFile) {
+    use vm_memory::GuestMemoryMmap;
+    use vmm::memory_snapshot::SnapshotMemory;
+
+    let pid = unsafe { libc::fork() };
+    match pid {
+        0 => {
+            set_panic_hook();
+            let mut event_manager = EventManager::new().unwrap();
+            let empty_seccomp_filter = get_seccomp_filter(SeccompLevel::None).unwrap();
+
+            // Deserialize microVM state.
+            snapshot_file.as_file().seek(SeekFrom::Start(0)).unwrap();
+            let microvm_state: MicrovmState =
+                Snapshot::load(&mut snapshot_file.as_file(), VERSION_MAP.clone()).unwrap();
+            let mem = GuestMemoryMmap::restore(memory_file.as_file(), &microvm_state.memory_state)
+                .unwrap();
+
+            // Build microVM from state.
+            let vmm = build_microvm_from_snapshot(
+                &mut event_manager,
+                microvm_state,
+                mem,
+                false,
+                &empty_seccomp_filter,
+            )
+            .unwrap();
+            // For now we're happy we got this far, we don't test what the guest is actually doing.
+            vmm.lock().unwrap().stop(0);
+        }
+        vmm_pid => {
+            // Parent process: wait for the vmm to exit.
+            wait_vmm_child_process(vmm_pid);
+        }
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
 #[test]
-fn test_create_snapshot() {
+fn test_create_and_load_snapshot() {
     // Create diff snapshot.
-    create_snapshot(true);
+    let (snapshot_file, memory_file) = verify_create_snapshot(true);
+    // Create a new microVm from snapshot. This only tests code-level logic; it verifies
+    // that a microVM can be built with no errors from given snapshot.
+    // It does _not_ verify that the guest is actually restored properly. We're using
+    // python integration tests for that.
+    verify_load_snapshot(snapshot_file, memory_file);
+
     // Create full snapshot.
-    create_snapshot(false);
+    let (snapshot_file, memory_file) = verify_create_snapshot(false);
+    // Create a new microVm from snapshot. This only tests code-level logic; it verifies
+    // that a microVM can be built with no errors from given snapshot.
+    // It does _not_ verify that the guest is actually restored properly. We're using
+    // python integration tests for that.
+    verify_load_snapshot(snapshot_file, memory_file);
 }

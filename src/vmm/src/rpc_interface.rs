@@ -12,14 +12,12 @@ use super::Vmm;
 
 use super::Error as VmmError;
 use arch::DeviceType;
-use builder::StartMicrovmError;
+use builder::{self, StartMicrovmError};
 use device_manager::mmio::MMIO_CFG_SPACE_OFF;
 use devices::virtio::{Block, MmioTransport, Net, TYPE_BLOCK, TYPE_NET};
 use logger::METRICS;
 #[cfg(target_arch = "x86_64")]
-use persist;
-#[cfg(target_arch = "x86_64")]
-use persist::CreateSnapshotError;
+use persist::{self, CreateSnapshotError, LoadSnapshotError};
 use polly::event_manager::EventManager;
 use resources::VmResources;
 use seccomp::BpfProgram;
@@ -28,6 +26,7 @@ use version_map::VERSION_MAP;
 use vmm_config;
 use vmm_config::boot_source::{BootSourceConfig, BootSourceConfigError};
 use vmm_config::drive::{BlockDeviceConfig, DriveError};
+use vmm_config::instance_info::InstanceInfo;
 use vmm_config::logger::{LoggerConfig, LoggerConfigError};
 use vmm_config::machine_config::{VmConfig, VmConfigError};
 use vmm_config::metrics::{MetricsConfig, MetricsConfigError};
@@ -36,8 +35,7 @@ use vmm_config::net::{
     NetworkInterfaceConfig, NetworkInterfaceError, NetworkInterfaceUpdateConfig,
 };
 #[cfg(target_arch = "x86_64")]
-use vmm_config::snapshot::CreateSnapshotParams;
-use vmm_config::snapshot::LoadSnapshotParams;
+use vmm_config::snapshot::{CreateSnapshotParams, LoadSnapshotParams};
 use vmm_config::vsock::{VsockConfigError, VsockDeviceConfig};
 
 /// This enum represents the public interface of the VMM. Each action contains various
@@ -71,6 +69,7 @@ pub enum VmmAction {
     /// Load the microVM state using as input the `LoadSnapshotParams`. This action can only be
     /// called before the microVM has booted. If this action is successful, the loaded microVM will
     /// be in `Paused` state. Should change this state to `Resumed` for the microVM to run.
+    #[cfg(target_arch = "x86_64")]
     LoadSnapshot(LoadSnapshotParams),
     /// Pause the guest, by pausing the microVM VCPUs.
     Pause,
@@ -112,6 +111,9 @@ pub enum VmmActionError {
     DriveConfig(DriveError),
     /// Internal Vmm error.
     InternalVmm(VmmError),
+    /// Loading a microVM snapshot failed.
+    #[cfg(target_arch = "x86_64")]
+    LoadSnapshot(LoadSnapshotError),
     /// The action `ConfigureLogger` failed because of bad user input.
     Logger(LoggerConfigError),
     /// One of the actions `GetVmConfiguration` or `SetVmConfiguration` failed because of bad input.
@@ -145,6 +147,8 @@ impl Display for VmmActionError {
                 CreateSnapshot(err) => err.to_string(),
                 DriveConfig(err) => err.to_string(),
                 InternalVmm(err) => format!("Internal Vmm error: {}", err),
+                #[cfg(target_arch = "x86_64")]
+                LoadSnapshot(err) => format!("Load microVM snapshot error: {}", err),
                 Logger(err) => err.to_string(),
                 MachineConfig(err) => err.to_string(),
                 Metrics(err) => err.to_string(),
@@ -159,7 +163,7 @@ impl Display for VmmActionError {
                         .to_string()
                 }
                 StartMicrovm(err) => err.to_string(),
-                /// The action `SetVsockDevice` failed because of bad user input.
+                // The action `SetVsockDevice` failed because of bad user input.
                 VsockConfig(err) => err.to_string(),
             }
         )
@@ -174,16 +178,12 @@ pub enum VmmData {
     Empty,
     /// The microVM configuration represented by `VmConfig`.
     MachineConfiguration(VmConfig),
-    /// No data is sent on the channel as the operation doesn't
-    /// have a handler implemented yet.
-    // This should be removed once we add an implementation for it.
-    NotFound,
 }
 
 /// Enables pre-boot setup and instantiation of a Firecracker VMM.
 pub struct PrebootApiController<'a> {
     seccomp_filter: BpfProgram,
-    firecracker_version: String,
+    instance_info: InstanceInfo,
     vm_resources: &'a mut VmResources,
     event_manager: &'a mut EventManager,
     built_vmm: Option<Arc<Mutex<Vmm>>>,
@@ -193,13 +193,13 @@ impl<'a> PrebootApiController<'a> {
     /// Constructor for the PrebootApiController.
     pub fn new(
         seccomp_filter: BpfProgram,
-        firecracker_version: String,
+        instance_info: InstanceInfo,
         vm_resources: &'a mut VmResources,
         event_manager: &'a mut EventManager,
     ) -> PrebootApiController<'a> {
         PrebootApiController {
             seccomp_filter,
-            firecracker_version,
+            instance_info,
             vm_resources,
             event_manager,
             built_vmm: None,
@@ -214,7 +214,7 @@ impl<'a> PrebootApiController<'a> {
     pub fn build_microvm_from_requests<F, G>(
         seccomp_filter: BpfProgram,
         event_manager: &mut EventManager,
-        firecracker_version: String,
+        instance_info: InstanceInfo,
         recv_req: F,
         respond: G,
     ) -> (VmResources, Arc<Mutex<Vmm>>)
@@ -225,7 +225,7 @@ impl<'a> PrebootApiController<'a> {
         let mut vm_resources = VmResources::default();
         let mut preboot_controller = PrebootApiController::new(
             seccomp_filter,
-            firecracker_version,
+            instance_info,
             &mut vm_resources,
             event_manager,
         );
@@ -258,7 +258,7 @@ impl<'a> PrebootApiController<'a> {
                 .map(|_| VmmData::Empty)
                 .map_err(VmmActionError::BootSource),
             ConfigureLogger(logger_cfg) => {
-                vmm_config::logger::init_logger(logger_cfg, &self.firecracker_version)
+                vmm_config::logger::init_logger(logger_cfg, &self.instance_info)
                     .map(|_| VmmData::Empty)
                     .map_err(VmmActionError::Logger)
             }
@@ -278,7 +278,18 @@ impl<'a> PrebootApiController<'a> {
                 .build_net_device(netif_body)
                 .map(|_| VmmData::Empty)
                 .map_err(VmmActionError::NetworkConfig),
-            LoadSnapshot(_snapshot_load_cfg) => Ok(VmmData::NotFound),
+            #[cfg(target_arch = "x86_64")]
+            LoadSnapshot(snapshot_load_cfg) => persist::load_snapshot(
+                &mut self.event_manager,
+                &self.seccomp_filter,
+                snapshot_load_cfg,
+                VERSION_MAP.clone(),
+            )
+            .map(|vmm| {
+                self.built_vmm = Some(vmm);
+                VmmData::Empty
+            })
+            .map_err(VmmActionError::LoadSnapshot),
             SetVsockDevice(vsock_cfg) => self
                 .vm_resources
                 .set_vsock_device(vsock_cfg)
@@ -294,7 +305,7 @@ impl<'a> PrebootApiController<'a> {
                 .set_mmds_config(mmds_config)
                 .map(|_| VmmData::Empty)
                 .map_err(VmmActionError::MmdsConfig),
-            StartMicroVm => super::builder::build_microvm(
+            StartMicroVm => builder::build_microvm_for_boot(
                 &self.vm_resources,
                 &mut self.event_manager,
                 &self.seccomp_filter,
@@ -358,10 +369,11 @@ impl RuntimeApiController {
             | ConfigureMetrics(_)
             | InsertBlockDevice(_)
             | InsertNetworkDevice(_)
-            | LoadSnapshot(_)
             | SetVsockDevice(_)
             | SetMmdsConfiguration(_)
             | SetVmConfiguration(_) => Err(VmmActionError::OperationNotSupportedPostBoot),
+            #[cfg(target_arch = "x86_64")]
+            LoadSnapshot(_) => Err(VmmActionError::OperationNotSupportedPostBoot),
             StartMicroVm => Err(VmmActionError::StartMicrovm(
                 StartMicrovmError::MicroVMAlreadyRunning,
             )),
@@ -509,15 +521,6 @@ impl RuntimeApiController {
                 .expect("Unexpected BusDevice type")
                 .device();
 
-            macro_rules! get_handler_arg {
-                ($rate_limiter: ident, $metric: ident) => {{
-                    new_cfg
-                        .$rate_limiter
-                        .map(|rl| rl.$metric.map(vmm_config::TokenBucketConfig::into))
-                        .unwrap_or(None)
-                }};
-            }
-
             virtio_device
                 .lock()
                 .expect("Poisoned lock")
@@ -525,10 +528,10 @@ impl RuntimeApiController {
                 .downcast_mut::<Net>()
                 .unwrap()
                 .patch_rate_limiters(
-                    get_handler_arg!(rx_rate_limiter, bandwidth),
-                    get_handler_arg!(rx_rate_limiter, ops),
-                    get_handler_arg!(tx_rate_limiter, bandwidth),
-                    get_handler_arg!(tx_rate_limiter, ops),
+                    new_cfg.rx_bytes(),
+                    new_cfg.rx_ops(),
+                    new_cfg.tx_bytes(),
+                    new_cfg.tx_ops(),
                 );
         } else {
             return Err(VmmActionError::NetworkConfig(

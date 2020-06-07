@@ -24,13 +24,12 @@ use ApiServer;
 
 use vmm::rpc_interface::{VmmAction, VmmActionError};
 
-#[allow(clippy::large_enum_variant)]
 pub enum ParsedRequest {
     GetInstanceInfo,
     GetMMDS,
     PatchMMDS(Value),
     PutMMDS(Value),
-    Sync(VmmAction),
+    Sync(Box<VmmAction>),
 }
 
 impl ParsedRequest {
@@ -96,11 +95,6 @@ impl ParsedRequest {
                     response.set_body(Body::new(vm_config.to_string()));
                     response
                 }
-                VmmData::NotFound => {
-                    info!("The request was executed successfully, but there is not an implementation \
-                     for it at this moment. Status code: 501 Not Implemented.");
-                    Response::new(Version::Http11, StatusCode::NotImplemented)
-                }
             },
             Err(vmm_action_error) => {
                 error!(
@@ -114,6 +108,11 @@ impl ParsedRequest {
                 response
             }
         }
+    }
+
+    /// Helper function to avoid boiler-plate code.
+    pub fn new_sync(vmm_action: VmmAction) -> ParsedRequest {
+        ParsedRequest::Sync(Box::new(vmm_action))
     }
 }
 
@@ -232,7 +231,7 @@ pub fn checked_id(id: &str) -> Result<&str, Error> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     use std::io::Write;
@@ -260,6 +259,13 @@ mod tests {
                 }
                 _ => false,
             }
+        }
+    }
+
+    pub(crate) fn vmm_action_from_request(req: ParsedRequest) -> VmmAction {
+        match req {
+            ParsedRequest::Sync(vmm_action) => *vmm_action,
+            _ => panic!("Invalid request"),
         }
     }
 
@@ -480,16 +486,6 @@ mod tests {
              Content-Length: 122\r\n\r\n{}",
             VmConfig::default().to_string()
         );
-        assert_eq!(&buf[..], expected_response.as_bytes());
-
-        // Vmm data not found.
-        let mut buf: [u8; 66] = [0; 66];
-        let response = ParsedRequest::convert_to_response(Ok(VmmData::NotFound));
-        assert!(response.write_all(&mut buf.as_mut()).is_ok());
-        let expected_response = "HTTP/1.1 501 \r\n\
-                                 Server: Firecracker API\r\n\
-                                 Connection: keep-alive\r\n\r\n"
-            .to_string();
         assert_eq!(&buf[..], expected_response.as_bytes());
 
         // Error.

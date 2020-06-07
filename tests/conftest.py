@@ -117,7 +117,7 @@ if os.geteuid() != 0:
     raise PermissionError("Test session needs to be run as root.")
 
 
-def test_images_s3_bucket():
+def _test_images_s3_bucket():
     """Auxiliary function for getting this session's bucket name."""
     return os.environ.get(
         ENV_TEST_IMAGES_S3_BUCKET,
@@ -125,7 +125,7 @@ def test_images_s3_bucket():
     )
 
 
-MICROVM_S3_FETCHER = MicrovmImageS3Fetcher(test_images_s3_bucket())
+MICROVM_S3_FETCHER = MicrovmImageS3Fetcher(_test_images_s3_bucket())
 
 
 def init_microvm(root_path, bin_cloner_path):
@@ -192,11 +192,12 @@ def test_session_tmp_path(test_session_root_path):
     shutil.rmtree(tmp_path)
 
 
-def _gcc_compile(src_file, output_file):
+def _gcc_compile(src_file, output_file, extra_flags="-static -O3"):
     """Build a source file with gcc."""
-    compile_cmd = 'gcc {} -o {} -static -O3'.format(
+    compile_cmd = 'gcc {} -o {} {}'.format(
         src_file,
-        output_file
+        output_file,
+        extra_flags
     )
     utils.run_cmd(compile_cmd)
 
@@ -232,6 +233,22 @@ def bin_vsock_path(test_session_root_path):
         vsock_helper_bin_path
     )
     yield vsock_helper_bin_path
+
+
+@pytest.fixture(scope='session')
+def change_net_config_space_bin(test_session_root_path):
+    """Build a binary that changes the MMIO config space."""
+    # pylint: disable=redefined-outer-name
+    change_net_config_space_bin = os.path.join(
+        test_session_root_path,
+        'change_net_config_space'
+    )
+    _gcc_compile(
+        'host_tools/change_net_config_space.c',
+        change_net_config_space_bin,
+        extra_flags=""
+    )
+    yield change_net_config_space_bin
 
 
 @pytest.fixture(scope='session')
@@ -448,9 +465,9 @@ TEST_MICROVM_CAP_FIXTURE_TEMPLATE = (
 # provide a way to do that outright, but luckily all of python is just lists of
 # of lists and a cursor, so exec() works fine here.
 for capability in MICROVM_S3_FETCHER.enum_capabilities():
-    test_microvm_cap_fixture = (
+    TEST_MICROVM_CAP_FIXTURE = (
         TEST_MICROVM_CAP_FIXTURE_TEMPLATE.replace('CAP', capability)
     )
     # pylint: disable=exec-used
     # This is the most straightforward way to achieve this result.
-    exec(test_microvm_cap_fixture)
+    exec(TEST_MICROVM_CAP_FIXTURE)

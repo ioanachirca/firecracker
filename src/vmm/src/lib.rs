@@ -42,7 +42,7 @@ pub mod builder;
 /// Syscalls allowed through the seccomp filter.
 pub mod default_syscalls;
 pub(crate) mod device_manager;
-pub(crate) mod memory_dump;
+pub mod memory_snapshot;
 /// Save/restore utilities.
 pub mod persist;
 /// Resource store for configured microVM resources.
@@ -72,11 +72,12 @@ use device_manager::legacy::PortIODeviceManager;
 use device_manager::mmio::MMIODeviceManager;
 use devices::BusDevice;
 use logger::{LoggerError, MetricsError, METRICS};
-
 #[cfg(target_arch = "x86_64")]
-use persist::{MicrovmState, SaveMicrovmStateError, VmInfo};
+use memory_snapshot::SnapshotMemory;
+#[cfg(target_arch = "x86_64")]
+use persist::{MicrovmState, MicrovmStateError, VmInfo};
 use polly::event_manager::{self, EventManager, Subscriber};
-use seccomp::{BpfProgram, BpfProgramRef, SeccompFilter};
+use seccomp::BpfProgramRef;
 #[cfg(target_arch = "x86_64")]
 use snapshot::Persist;
 use utils::epoll::{EpollEvent, EventSet};
@@ -250,7 +251,6 @@ impl Vmm {
     pub fn start_vcpus(
         &mut self,
         mut vcpus: Vec<Vcpu>,
-        vmm_seccomp_filter: BpfProgram,
         vcpu_seccomp_filter: BpfProgramRef,
     ) -> Result<()> {
         let vcpu_count = vcpus.len();
@@ -273,14 +273,6 @@ impl Vmm {
                     .map_err(Error::VcpuHandle)?,
             );
         }
-
-        // Load seccomp filters for the VMM thread.
-        // Execution panics if filters cannot be loaded, use --seccomp-level=0 if skipping filters
-        // altogether is the desired behaviour.
-        SeccompFilter::apply(vmm_seccomp_filter).map_err(Error::SeccompFilters)?;
-
-        // The vcpus start off in the `Paused` state, let them run.
-        self.resume_vcpus()?;
 
         Ok(())
     }
@@ -383,23 +375,20 @@ impl Vmm {
 
     /// Saves the state of a paused Microvm.
     #[cfg(target_arch = "x86_64")]
-    pub fn save_state(&mut self) -> std::result::Result<MicrovmState, SaveMicrovmStateError> {
+    pub fn save_state(&mut self) -> std::result::Result<MicrovmState, MicrovmStateError> {
+        use self::MicrovmStateError::SaveVmState;
         let vcpu_states = self.save_vcpu_states()?;
 
-        let vm_state = self
-            .vm
-            .save_state()
-            .map_err(SaveMicrovmStateError::InvalidVmState)?;
+        let vm_state = self.vm.save_state().map_err(SaveVmState)?;
 
         let device_states = self.mmio_device_manager.save();
 
-        let mem_size_mib =
-            self.guest_memory()
-                .map_and_fold(0, |(_, region)| region.len(), |a, b| a + b)
-                >> 20;
+        let mem_size_mib = persist::mem_size_mib(self.guest_memory());
+        let memory_state = self.guest_memory().describe();
 
         Ok(MicrovmState {
             vm_info: VmInfo { mem_size_mib },
+            memory_state,
             vm_state,
             vcpu_states,
             device_states,
@@ -407,11 +396,12 @@ impl Vmm {
     }
 
     #[cfg(target_arch = "x86_64")]
-    fn save_vcpu_states(&mut self) -> std::result::Result<Vec<VcpuState>, SaveMicrovmStateError> {
+    fn save_vcpu_states(&mut self) -> std::result::Result<Vec<VcpuState>, MicrovmStateError> {
+        use self::MicrovmStateError::*;
         for handle in self.vcpus_handles.iter() {
             handle
                 .send_event(VcpuEvent::SaveState)
-                .map_err(SaveMicrovmStateError::SignalVcpu)?;
+                .map_err(SignalVcpu)?;
         }
 
         let vcpu_responses = self
@@ -421,21 +411,61 @@ impl Vmm {
             .map(|handle| {
                 handle
                     .response_receiver()
-                    .recv_timeout(Duration::from_millis(400))
+                    .recv_timeout(Duration::from_millis(1000))
             })
             .collect::<std::result::Result<Vec<VcpuResponse>, RecvTimeoutError>>()
-            .map_err(|_| SaveMicrovmStateError::InvalidVcpuState)?;
+            .map_err(|_| UnexpectedVcpuResponse)?;
 
         let vcpu_states = vcpu_responses
             .into_iter()
             .map(|response| match response {
-                VcpuResponse::SaveState(state) => Ok(*state),
-                VcpuResponse::SaveStateFailed(_) => Err(SaveMicrovmStateError::InvalidVcpuState),
-                _ => Err(SaveMicrovmStateError::InvalidVcpuState),
+                VcpuResponse::SavedState(state) => Ok(*state),
+                VcpuResponse::Error(e) => Err(SaveVcpuState(e)),
+                _ => Err(UnexpectedVcpuResponse),
             })
-            .collect::<std::result::Result<Vec<VcpuState>, SaveMicrovmStateError>>()?;
+            .collect::<std::result::Result<Vec<VcpuState>, MicrovmStateError>>()?;
 
         Ok(vcpu_states)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    /// Restores vcpus kvm states.
+    pub fn restore_vcpu_states(
+        &mut self,
+        mut vcpu_states: Vec<VcpuState>,
+    ) -> std::result::Result<(), MicrovmStateError> {
+        use self::MicrovmStateError::*;
+
+        if vcpu_states.len() != self.vcpus_handles.len() {
+            return Err(InvalidInput);
+        }
+        for (handle, state) in self.vcpus_handles.iter().zip(vcpu_states.drain(..)) {
+            handle
+                .send_event(VcpuEvent::RestoreState(Box::new(state)))
+                .map_err(MicrovmStateError::SignalVcpu)?;
+        }
+
+        let vcpu_responses = self
+            .vcpus_handles
+            .iter()
+            // `Iterator::collect` can transform a `Vec<Result>` into a `Result<Vec>`.
+            .map(|handle| {
+                handle
+                    .response_receiver()
+                    .recv_timeout(Duration::from_millis(1000))
+            })
+            .collect::<std::result::Result<Vec<VcpuResponse>, RecvTimeoutError>>()
+            .map_err(|_| MicrovmStateError::UnexpectedVcpuResponse)?;
+
+        for response in vcpu_responses.into_iter() {
+            match response {
+                VcpuResponse::RestoredState => (),
+                VcpuResponse::Error(e) => return Err(RestoreVcpuState(e)),
+                _ => return Err(MicrovmStateError::UnexpectedVcpuResponse),
+            }
+        }
+
+        Ok(())
     }
 
     /// Retrieves the KVM dirty bitmap for each of the guest's memory regions.

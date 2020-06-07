@@ -129,13 +129,10 @@ impl<T: Read + Write> ClientConnection<T> {
 
                 // Send an error response for the request that gave us the error.
                 let mut error_response = Response::new(Version::Http11, StatusCode::BadRequest);
-                error_response.set_body(Body::new(
-                    format!(
-                        "{{ \"error\": \"{}\nAll previous unanswered requests will be dropped.\" }}",
-                        inner.to_string()
-                    )
-                    .to_string(),
-                ));
+                error_response.set_body(Body::new(format!(
+                    "{{ \"error\": \"{}\nAll previous unanswered requests will be dropped.\" }}",
+                    inner.to_string()
+                )));
                 self.connection.enqueue_response(error_response);
             }
             Err(ConnectionError::InvalidWrite) => {
@@ -530,22 +527,27 @@ impl HttpServer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
 
     use common::Body;
+    use utils::tempfile::TempFile;
+
+    fn get_temp_socket_file() -> TempFile {
+        let mut path_to_socket = TempFile::new().unwrap();
+        path_to_socket.remove().unwrap();
+        path_to_socket
+    }
 
     #[test]
     fn test_wait_one_connection() {
-        let path_to_socket = "/tmp/test_socket_http_server1.sock";
-        fs::remove_file(path_to_socket).unwrap_or_default();
+        let path_to_socket = get_temp_socket_file();
 
-        let mut server = HttpServer::new(path_to_socket.to_string()).unwrap();
+        let mut server = HttpServer::new(path_to_socket.as_path()).unwrap();
         server.start_server().unwrap();
 
         // Test one incoming connection.
-        let mut socket = UnixStream::connect(path_to_socket).unwrap();
+        let mut socket = UnixStream::connect(path_to_socket.as_path()).unwrap();
         assert!(server.requests().unwrap().is_empty());
 
         socket
@@ -571,19 +573,17 @@ mod tests {
 
         let mut buf: [u8; 1024] = [0; 1024];
         assert!(socket.read(&mut buf[..]).unwrap() > 0);
-        fs::remove_file(path_to_socket).unwrap();
     }
 
     #[test]
     fn test_wait_concurrent_connections() {
-        let path_to_socket = "/tmp/test_socket_http_server2.sock";
-        fs::remove_file(path_to_socket).unwrap_or_default();
+        let path_to_socket = get_temp_socket_file();
 
-        let mut server = HttpServer::new(path_to_socket.to_string()).unwrap();
+        let mut server = HttpServer::new(path_to_socket.as_path()).unwrap();
         server.start_server().unwrap();
 
         // Test two concurrent connections.
-        let mut first_socket = UnixStream::connect(path_to_socket).unwrap();
+        let mut first_socket = UnixStream::connect(path_to_socket.as_path()).unwrap();
         assert!(server.requests().unwrap().is_empty());
 
         first_socket
@@ -593,7 +593,7 @@ mod tests {
                                Content-Type: application/json\r\n\r\nwhatever body",
             )
             .unwrap();
-        let mut second_socket = UnixStream::connect(path_to_socket).unwrap();
+        let mut second_socket = UnixStream::connect(path_to_socket.as_path()).unwrap();
 
         let mut req_vec = server.requests().unwrap();
         let server_request = req_vec.remove(0);
@@ -645,19 +645,17 @@ mod tests {
         assert!(second_socket.read(&mut buf[..]).unwrap() > 0);
         second_socket.shutdown(std::net::Shutdown::Both).unwrap();
         assert!(server.requests().unwrap().is_empty());
-        fs::remove_file(path_to_socket).unwrap();
     }
 
     #[test]
     fn test_wait_expect_connection() {
-        let path_to_socket = "/tmp/test_socket_http_server3.sock";
-        fs::remove_file(path_to_socket).unwrap_or_default();
+        let path_to_socket = get_temp_socket_file();
 
-        let mut server = HttpServer::new(path_to_socket.to_string()).unwrap();
+        let mut server = HttpServer::new(path_to_socket.as_path()).unwrap();
         server.start_server().unwrap();
 
         // Test one incoming connection with `Expect: 100-continue`.
-        let mut socket = UnixStream::connect(path_to_socket).unwrap();
+        let mut socket = UnixStream::connect(path_to_socket.as_path()).unwrap();
         assert!(server.requests().unwrap().is_empty());
 
         socket
@@ -696,42 +694,37 @@ mod tests {
 
         let mut buf: [u8; 1024] = [0; 1024];
         assert!(socket.read(&mut buf[..]).unwrap() > 0);
-        fs::remove_file(path_to_socket).unwrap();
     }
 
     #[test]
     fn test_wait_many_connections() {
-        let path_to_socket = "/tmp/test_socket_http_server4.sock";
-        fs::remove_file(path_to_socket).unwrap_or_default();
+        let path_to_socket = get_temp_socket_file();
 
-        let mut server = HttpServer::new(path_to_socket.to_string()).unwrap();
+        let mut server = HttpServer::new(path_to_socket.as_path()).unwrap();
         server.start_server().unwrap();
 
         let mut sockets: Vec<UnixStream> = Vec::with_capacity(11);
         for _ in 0..MAX_CONNECTIONS {
-            sockets.push(UnixStream::connect(path_to_socket).unwrap());
+            sockets.push(UnixStream::connect(path_to_socket.as_path()).unwrap());
             assert!(server.requests().unwrap().is_empty());
         }
 
-        sockets.push(UnixStream::connect(path_to_socket).unwrap());
+        sockets.push(UnixStream::connect(path_to_socket.as_path()).unwrap());
         assert!(server.requests().unwrap().is_empty());
         let mut buf: [u8; 120] = [0; 120];
         sockets[MAX_CONNECTIONS].read_exact(&mut buf).unwrap();
         assert_eq!(&buf[..], SERVER_FULL_ERROR_MESSAGE);
-
-        fs::remove_file(path_to_socket).unwrap();
     }
 
     #[test]
     fn test_wait_parse_error() {
-        let path_to_socket = "/tmp/test_socket_http_server5.sock";
-        fs::remove_file(path_to_socket).unwrap_or_default();
+        let path_to_socket = get_temp_socket_file();
 
-        let mut server = HttpServer::new(path_to_socket.to_string()).unwrap();
+        let mut server = HttpServer::new(path_to_socket.as_path()).unwrap();
         server.start_server().unwrap();
 
         // Test one incoming connection.
-        let mut socket = UnixStream::connect(path_to_socket).unwrap();
+        let mut socket = UnixStream::connect(path_to_socket.as_path()).unwrap();
         socket.set_nonblocking(true).unwrap();
         assert!(server.requests().unwrap().is_empty());
 
@@ -754,22 +747,19 @@ mod tests {
                               Content-Length: 80\r\n\r\n{ \"error\": \"Invalid header.\n\
                               All previous unanswered requests will be dropped.\" }";
         assert_eq!(&buf[..], &error_message[..]);
-
-        fs::remove_file(path_to_socket).unwrap();
     }
 
     #[test]
     fn test_wait_in_flight_responses() {
-        let path_to_socket = "/tmp/test_socket_http_server6.sock";
-        fs::remove_file(path_to_socket).unwrap_or_default();
+        let path_to_socket = get_temp_socket_file();
 
-        let mut server = HttpServer::new(path_to_socket.to_string()).unwrap();
+        let mut server = HttpServer::new(path_to_socket.as_path()).unwrap();
         server.start_server().unwrap();
 
         // Test a connection dropped and then a new one appearing
         // before the user had a chance to send the response to the
         // first one.
-        let mut first_socket = UnixStream::connect(path_to_socket).unwrap();
+        let mut first_socket = UnixStream::connect(path_to_socket.as_path()).unwrap();
         assert!(server.requests().unwrap().is_empty());
 
         first_socket
@@ -785,7 +775,7 @@ mod tests {
 
         first_socket.shutdown(std::net::Shutdown::Both).unwrap();
         assert!(server.requests().unwrap().is_empty());
-        let mut second_socket = UnixStream::connect(path_to_socket).unwrap();
+        let mut second_socket = UnixStream::connect(path_to_socket.as_path()).unwrap();
         second_socket.set_nonblocking(true).unwrap();
         assert!(server.requests().unwrap().is_empty());
 
@@ -837,6 +827,5 @@ mod tests {
         assert!(second_socket.read(&mut buf[..]).unwrap() > 0);
         second_socket.shutdown(std::net::Shutdown::Both).unwrap();
         assert!(server.requests().is_ok());
-        fs::remove_file(path_to_socket).unwrap();
     }
 }

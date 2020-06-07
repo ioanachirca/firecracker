@@ -16,7 +16,7 @@ use dumbo::ns::MmdsNetworkStack;
 use dumbo::{EthernetFrame, MacAddr, MAC_ADDR_LEN};
 use libc::EAGAIN;
 use logger::{Metric, METRICS};
-use rate_limiter::{RateLimiter, TokenBucket, TokenType};
+use rate_limiter::{BucketUpdate, RateLimiter, TokenType};
 #[cfg(not(test))]
 use std::io::Read;
 use std::io::Write;
@@ -556,10 +556,10 @@ impl Net {
     /// Updates the parameters for the rate limiters
     pub fn patch_rate_limiters(
         &mut self,
-        rx_bytes: Option<TokenBucket>,
-        rx_ops: Option<TokenBucket>,
-        tx_bytes: Option<TokenBucket>,
-        tx_ops: Option<TokenBucket>,
+        rx_bytes: BucketUpdate,
+        rx_ops: BucketUpdate,
+        tx_bytes: BucketUpdate,
+        tx_ops: BucketUpdate,
     ) {
         self.rx_rate_limiter.update_buckets(rx_bytes, rx_ops);
         self.tx_rate_limiter.update_buckets(tx_bytes, tx_ops);
@@ -728,9 +728,8 @@ impl VirtioDevice for Net {
             METRICS.net.cfg_fails.inc();
             return;
         }
-        let (_, right) = config_space_bytes.split_at_mut(offset as usize);
-        right.copy_from_slice(&data[..]);
 
+        config_space_bytes[offset as usize..(offset + data_len) as usize].copy_from_slice(data);
         self.guest_mac = Some(MacAddr::from_bytes_unchecked(
             &self.config_space.guest_mac[..MAC_ADDR_LEN],
         ));
@@ -818,7 +817,7 @@ pub(crate) mod tests {
 
             let mut net = Net::new_with_tap(
                 format!("net-device{}", next_tap),
-                tap_dev_name.clone(),
+                tap_dev_name,
                 Some(&guest_mac),
                 RateLimiter::default(),
                 RateLimiter::default(),
@@ -979,6 +978,14 @@ pub(crate) mod tests {
         // Check that the guest MAC was updated.
         let expected_guest_mac = MacAddr::from_bytes_unchecked(&new_config);
         assert_eq!(expected_guest_mac, net.guest_mac.unwrap());
+
+        // Partial write (this is how the kernel sets a new mac address) - byte by byte.
+        let new_config = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
+        for i in 0..new_config.len() {
+            net.write_config(i as u64, &new_config[i..=i]);
+        }
+        net.read_config(0, &mut new_config_read);
+        assert_eq!(new_config, new_config_read);
 
         // Invalid write.
         net.write_config(5, &new_config);
@@ -1306,10 +1313,11 @@ pub(crate) mod tests {
         let mem = Net::default_guest_memory();
         let (rxq, txq) = Net::virtqueues(&mem);
         net.assign_queues(rxq.create_queue(), txq.create_queue());
-        net.activate(mem.clone()).unwrap();
 
         let net = Arc::new(Mutex::new(net));
         event_manager.add_subscriber(net.clone()).unwrap();
+
+        net.lock().unwrap().activate(mem.clone()).unwrap();
 
         // Process the activate event.
         let ev_count = event_manager.run_with_timeout(50).unwrap();
@@ -1368,7 +1376,7 @@ pub(crate) mod tests {
         net.assign_queues(rxq.create_queue(), txq.create_queue());
         net.activate(mem.clone()).unwrap();
 
-        net.rx_rate_limiter = RateLimiter::new(0, None, 0, 0, None, 0).unwrap();
+        net.rx_rate_limiter = RateLimiter::new(0, 0, 0, 0, 0, 0).unwrap();
         let rate_limiter_event =
             EpollEvent::new(EventSet::IN, net.rx_rate_limiter.as_raw_fd() as u64);
         check_metric_after_block!(
@@ -1387,7 +1395,7 @@ pub(crate) mod tests {
         net.assign_queues(rxq.create_queue(), txq.create_queue());
         net.activate(mem.clone()).unwrap();
 
-        net.tx_rate_limiter = RateLimiter::new(0, None, 0, 0, None, 0).unwrap();
+        net.tx_rate_limiter = RateLimiter::new(0, 0, 0, 0, 0, 0).unwrap();
         let rate_limiter_event =
             EpollEvent::new(EventSet::IN, net.tx_rate_limiter.as_raw_fd() as u64);
         net.process(&rate_limiter_event, &mut event_manager);
@@ -1413,7 +1421,7 @@ pub(crate) mod tests {
         // Test TX bandwidth rate limiting
         {
             // create bandwidth rate limiter that allows 40960 bytes/s with bucket size 4096 bytes
-            let mut rl = RateLimiter::new(0x1000, None, 100, 0, None, 0).unwrap();
+            let mut rl = RateLimiter::new(0x1000, 0, 100, 0, 0, 0).unwrap();
             // use up the budget
             assert!(rl.consume(0x1000, TokenType::Bytes));
 
@@ -1463,7 +1471,7 @@ pub(crate) mod tests {
         // Test RX bandwidth rate limiting
         {
             // create bandwidth rate limiter that allows 40960 bytes/s with bucket size 4096 bytes
-            let mut rl = RateLimiter::new(0x1000, None, 100, 0, None, 0).unwrap();
+            let mut rl = RateLimiter::new(0x1000, 0, 100, 0, 0, 0).unwrap();
             // use up the budget
             assert!(rl.consume(0x1000, TokenType::Bytes));
 
@@ -1532,7 +1540,7 @@ pub(crate) mod tests {
         // Test TX ops rate limiting
         {
             // create ops rate limiter that allows 10 ops/s with bucket size 1 ops
-            let mut rl = RateLimiter::new(0, None, 0, 1, None, 100).unwrap();
+            let mut rl = RateLimiter::new(0, 0, 0, 1, 0, 100).unwrap();
             // use up the budget
             assert!(rl.consume(1, TokenType::Ops));
 
@@ -1577,7 +1585,7 @@ pub(crate) mod tests {
         // Test RX ops rate limiting
         {
             // create ops rate limiter that allows 10 ops/s with bucket size 1 ops
-            let mut rl = RateLimiter::new(0, None, 0, 1, None, 100).unwrap();
+            let mut rl = RateLimiter::new(0, 0, 0, 1, 0, 100).unwrap();
             // use up the budget
             assert!(rl.consume(0x800, TokenType::Ops));
 
@@ -1646,31 +1654,40 @@ pub(crate) mod tests {
         net.assign_queues(rxq.create_queue(), txq.create_queue());
         net.activate(mem.clone()).unwrap();
 
-        net.rx_rate_limiter = RateLimiter::new(10, None, 10, 2, None, 2).unwrap();
-        net.tx_rate_limiter = RateLimiter::new(10, None, 10, 2, None, 2).unwrap();
+        net.rx_rate_limiter = RateLimiter::new(10, 0, 10, 2, 0, 2).unwrap();
+        net.tx_rate_limiter = RateLimiter::new(10, 0, 10, 2, 0, 2).unwrap();
 
-        let rx_bytes = TokenBucket::new(1000, Some(1001), 1002);
-        let rx_ops = TokenBucket::new(1003, Some(1004), 1005);
-        let tx_bytes = TokenBucket::new(1006, Some(1007), 1008);
-        let tx_ops = TokenBucket::new(1009, Some(1010), 1011);
+        let rx_bytes = TokenBucket::new(1000, 1001, 1002).unwrap();
+        let rx_ops = TokenBucket::new(1003, 1004, 1005).unwrap();
+        let tx_bytes = TokenBucket::new(1006, 1007, 1008).unwrap();
+        let tx_ops = TokenBucket::new(1009, 1010, 1011).unwrap();
 
         net.patch_rate_limiters(
-            Some(rx_bytes.clone()),
-            Some(rx_ops.clone()),
-            Some(tx_bytes.clone()),
-            Some(tx_ops.clone()),
+            BucketUpdate::Update(rx_bytes.clone()),
+            BucketUpdate::Update(rx_ops.clone()),
+            BucketUpdate::Update(tx_bytes.clone()),
+            BucketUpdate::Update(tx_ops.clone()),
         );
-
         let compare_buckets = |a: &TokenBucket, b: &TokenBucket| {
             assert_eq!(a.capacity(), b.capacity());
             assert_eq!(a.one_time_burst(), b.one_time_burst());
             assert_eq!(a.refill_time_ms(), b.refill_time_ms());
         };
-
         compare_buckets(net.rx_rate_limiter.bandwidth().unwrap(), &rx_bytes);
         compare_buckets(net.rx_rate_limiter.ops().unwrap(), &rx_ops);
         compare_buckets(net.tx_rate_limiter.bandwidth().unwrap(), &tx_bytes);
         compare_buckets(net.tx_rate_limiter.ops().unwrap(), &tx_ops);
+
+        net.patch_rate_limiters(
+            BucketUpdate::Disabled,
+            BucketUpdate::Disabled,
+            BucketUpdate::Disabled,
+            BucketUpdate::Disabled,
+        );
+        assert!(net.rx_rate_limiter.bandwidth().is_none());
+        assert!(net.rx_rate_limiter.ops().is_none());
+        assert!(net.tx_rate_limiter.bandwidth().is_none());
+        assert!(net.tx_rate_limiter.ops().is_none());
     }
 
     #[test]

@@ -56,8 +56,7 @@ fn build_device_id(disk_image: &File) -> result::Result<String, Error> {
         blk_metadata.st_dev(),
         blk_metadata.st_rdev(),
         blk_metadata.st_ino()
-    )
-    .to_owned();
+    );
     Ok(device_id)
 }
 
@@ -141,7 +140,7 @@ impl Block {
             partuuid,
             disk_image_id: build_disk_image_id(&disk_image),
             disk_image,
-            disk_image_path: disk_image_path.clone(),
+            disk_image_path,
             disk_nsectors: disk_size / SECTOR_SIZE,
             avail_features,
             acked_features: 0u64,
@@ -357,8 +356,8 @@ impl VirtioDevice for Block {
             METRICS.block.cfg_fails.inc();
             return;
         }
-        let (_, right) = self.config_space.split_at_mut(offset as usize);
-        right.copy_from_slice(&data[..]);
+
+        self.config_space[offset as usize..(offset + data_len) as usize].copy_from_slice(data);
     }
 
     fn is_activated(&self) -> bool {
@@ -428,7 +427,7 @@ pub(crate) mod tests {
     /// Create a default Block instance using file at the specified path to be used in tests.
     pub fn default_block_with_path(path: String) -> Block {
         // Rate limiting is enabled but with a high operation rate (10 million ops/s).
-        let rate_limiter = RateLimiter::new(0, None, 0, 100_000, None, 10).unwrap();
+        let rate_limiter = RateLimiter::new(0, 0, 0, 100_000, 0, 10).unwrap();
 
         let id = "test".to_string();
         // The default block device is read-write and non-root.
@@ -543,8 +542,16 @@ pub(crate) mod tests {
         block.read_config(0, &mut actual_config_space);
         assert_eq!(actual_config_space, expected_config_space);
 
+        // If priviledged user writes to `/dev/mem`, in block config space - byte by byte.
+        let expected_config_space = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x00, 0x11];
+        for i in 0..expected_config_space.len() {
+            block.write_config(i as u64, &expected_config_space[i..=i]);
+        }
+        block.read_config(0, &mut actual_config_space);
+        assert_eq!(actual_config_space, expected_config_space);
+
         // Invalid write.
-        let new_config_space: [u8; CONFIG_SPACE_SIZE] = [0xd, 0xe, 0xa, 0xd, 0xb, 0xe, 0xe, 0xf];
+        let new_config_space = [0xd, 0xe, 0xa, 0xd, 0xb, 0xe, 0xe, 0xf];
         block.write_config(5, &new_config_space);
         // Make sure nothing got written.
         block.read_config(0, &mut actual_config_space);
@@ -849,7 +856,7 @@ pub(crate) mod tests {
         let queue_evt = EpollEvent::new(EventSet::IN, block.queue_evts[0].as_raw_fd() as u64);
 
         // Create bandwidth rate limiter that allows only 80 bytes/s with bucket size of 8 bytes.
-        let mut rl = RateLimiter::new(8, None, 100, 0, None, 0).unwrap();
+        let mut rl = RateLimiter::new(8, 0, 100, 0, 0, 0).unwrap();
         // Use up the budget.
         assert!(rl.consume(8, TokenType::Bytes));
 
@@ -914,7 +921,7 @@ pub(crate) mod tests {
         let queue_evt = EpollEvent::new(EventSet::IN, block.queue_evts[0].as_raw_fd() as u64);
 
         // Create ops rate limiter that allows only 10 ops/s with bucket size of 1 ops.
-        let mut rl = RateLimiter::new(0, None, 0, 1, None, 100).unwrap();
+        let mut rl = RateLimiter::new(0, 0, 0, 1, 0, 100).unwrap();
         // Use up the budget.
         assert!(rl.consume(1, TokenType::Ops));
 

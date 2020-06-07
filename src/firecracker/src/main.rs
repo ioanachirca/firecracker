@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 extern crate api_server;
-extern crate backtrace;
 extern crate libc;
 #[macro_use]
 extern crate logger;
@@ -15,8 +14,6 @@ extern crate vmm;
 
 mod api_server_adapter;
 mod metrics;
-
-use backtrace::Backtrace;
 
 use std::fs;
 use std::io;
@@ -73,8 +70,6 @@ fn main() {
         }
 
         METRICS.vmm.panic_count.inc();
-        let bt = Backtrace::new();
-        error!("{:?}", bt);
 
         // Write the metrics before aborting.
         if let Err(e) = METRICS.write() {
@@ -183,7 +178,14 @@ fn main() {
     let instance_id = arguments.value_as_string("id").unwrap();
     validate_instance_id(instance_id.as_str()).expect("Invalid instance ID");
 
-    LOGGER.set_instance_id(instance_id.clone());
+    let instance_info = InstanceInfo {
+        id: instance_id.clone(),
+        started: false,
+        vmm_version: FIRECRACKER_VERSION.to_string(),
+        app_name: "Firecracker".to_string(),
+    };
+
+    LOGGER.set_instance_id(instance_id);
 
     if let Some(log) = arguments.value_as_string("log-path") {
         // It's safe to unwrap here because the field's been provided with a default value.
@@ -200,7 +202,7 @@ fn main() {
             show_level,
             show_log_origin,
         );
-        init_logger(logger_config, FIRECRACKER_VERSION).expect("Could not initialize logger.");
+        init_logger(logger_config, &instance_info).expect("Could not initialize logger.");
     }
 
     // It's safe to unwrap here because the field's been provided with a default value.
@@ -236,12 +238,6 @@ fn main() {
             s.parse::<u64>()
                 .expect("'start-time-cpu-us' parameter expected to be of 'u64' type.")
         });
-        let instance_info = InstanceInfo {
-            id: instance_id,
-            started: false,
-            vmm_version: FIRECRACKER_VERSION.to_string(),
-            app_name: "Firecracker".to_string(),
-        };
         api_server_adapter::run_with_api(
             seccomp_filter,
             vmm_config_json,
@@ -251,7 +247,7 @@ fn main() {
             start_time_cpu_us,
         );
     } else {
-        run_without_api(seccomp_filter, vmm_config_json);
+        run_without_api(seccomp_filter, vmm_config_json, &instance_info);
     }
 }
 
@@ -260,16 +256,16 @@ fn build_microvm_from_json(
     seccomp_filter: BpfProgram,
     event_manager: &mut EventManager,
     config_json: String,
+    instance_info: &InstanceInfo,
 ) -> (VmResources, Arc<Mutex<vmm::Vmm>>) {
-    let vm_resources =
-        VmResources::from_json(&config_json, FIRECRACKER_VERSION).unwrap_or_else(|err| {
-            error!(
-                "Configuration for VMM from one single json failed: {:?}",
-                err
-            );
-            process::exit(i32::from(vmm::FC_EXIT_CODE_BAD_CONFIGURATION));
-        });
-    let vmm = vmm::builder::build_microvm(&vm_resources, event_manager, &seccomp_filter)
+    let vm_resources = VmResources::from_json(&config_json, instance_info).unwrap_or_else(|err| {
+        error!(
+            "Configuration for VMM from one single json failed: {:?}",
+            err
+        );
+        process::exit(i32::from(vmm::FC_EXIT_CODE_BAD_CONFIGURATION));
+    });
+    let vmm = vmm::builder::build_microvm_for_boot(&vm_resources, event_manager, &seccomp_filter)
         .unwrap_or_else(|err| {
             error!(
                 "Building VMM configured from cmdline json failed: {:?}",
@@ -282,7 +278,11 @@ fn build_microvm_from_json(
     (vm_resources, vmm)
 }
 
-fn run_without_api(seccomp_filter: BpfProgram, config_json: Option<String>) {
+fn run_without_api(
+    seccomp_filter: BpfProgram,
+    config_json: Option<String>,
+    instance_info: &InstanceInfo,
+) {
     let mut event_manager = EventManager::new().expect("Unable to create EventManager");
 
     // Create the firecracker metrics object responsible for periodically printing metrics.
@@ -299,6 +299,7 @@ fn run_without_api(seccomp_filter: BpfProgram, config_json: Option<String>) {
         &mut event_manager,
         // Safe to unwrap since '--no-api' requires this to be set.
         config_json.unwrap(),
+        instance_info,
     );
 
     // Start the metrics.

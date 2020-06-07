@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use super::RateLimiterConfig;
 use devices::virtio::Net;
 use dumbo::MacAddr;
+use rate_limiter::{BucketUpdate, TokenBucket};
 use utils::net::TapError;
 
 /// This struct represents the strongly typed equivalent of the json body from net iface
@@ -55,6 +56,50 @@ pub struct NetworkInterfaceUpdateConfig {
     /// New TX rate limiter config. Only provided data will be updated. I.e. if any optional data
     /// is missing, it will not be nullified, but left unchanged.
     pub tx_rate_limiter: Option<RateLimiterConfig>,
+}
+
+macro_rules! get_bucket_update {
+    ($self:ident, $rate_limiter: ident, $metric: ident) => {{
+        match &$self.$rate_limiter {
+            Some(rl_cfg) => match rl_cfg.$metric {
+                // There is data to update.
+                Some(tb_cfg) => {
+                    TokenBucket::new(
+                        tb_cfg.size,
+                        tb_cfg.one_time_burst.unwrap_or(0),
+                        tb_cfg.refill_time,
+                    )
+                    // Updated active rate-limiter.
+                    .map(BucketUpdate::Update)
+                    // Updated/deactivated rate-limiter
+                    .unwrap_or(BucketUpdate::Disabled)
+                }
+                // No update to the rate-limiter.
+                None => BucketUpdate::None,
+            },
+            // No update to the rate-limiter.
+            None => BucketUpdate::None,
+        }
+    }};
+}
+
+impl NetworkInterfaceUpdateConfig {
+    /// Provides a `BucketUpdate` description for the RX bandwidth rate limiter.
+    pub fn rx_bytes(&self) -> BucketUpdate {
+        get_bucket_update!(self, rx_rate_limiter, bandwidth)
+    }
+    /// Provides a `BucketUpdate` description for the RX ops rate limiter.
+    pub fn rx_ops(&self) -> BucketUpdate {
+        get_bucket_update!(self, rx_rate_limiter, ops)
+    }
+    /// Provides a `BucketUpdate` description for the TX bandwidth rate limiter.
+    pub fn tx_bytes(&self) -> BucketUpdate {
+        get_bucket_update!(self, tx_rate_limiter, bandwidth)
+    }
+    /// Provides a `BucketUpdate` description for the TX ops rate limiter.
+    pub fn tx_ops(&self) -> BucketUpdate {
+        get_bucket_update!(self, tx_rate_limiter, ops)
+    }
 }
 
 /// Errors associated with `NetworkInterfaceConfig`.
@@ -246,13 +291,13 @@ mod tests {
         guest_mac_1 = "01:23:45:67:89:0b";
         let netif_1 = create_netif(id_1, host_dev_name_1, guest_mac_1);
 
-        assert!(net_builder.build(netif_1.clone()).is_ok());
+        assert!(net_builder.build(netif_1).is_ok());
         assert_eq!(net_builder.net_devices.len(), 1);
 
         // Test update host_dev_name (the tap will be updated).
         host_dev_name_1 = "dev2";
         let netif_1 = create_netif(id_1, host_dev_name_1, guest_mac_1);
-        assert!(net_builder.build(netif_1.clone()).is_ok());
+        assert!(net_builder.build(netif_1).is_ok());
         assert_eq!(net_builder.net_devices.len(), 1);
     }
 
@@ -266,7 +311,7 @@ mod tests {
 
         // Adding the first valid network config.
         let netif_1 = create_netif(id_1, host_dev_name_1, guest_mac_1);
-        assert!(net_builder.build(netif_1.clone()).is_ok());
+        assert!(net_builder.build(netif_1).is_ok());
 
         // Error Cases for CREATE
         // Error Case: Add new network config with the same mac as netif_1.
@@ -280,11 +325,7 @@ mod tests {
             guest_mac_1.to_string()
         );
         assert_eq!(
-            net_builder
-                .build(netif_2.clone())
-                .err()
-                .unwrap()
-                .to_string(),
+            net_builder.build(netif_2).err().unwrap().to_string(),
             expected_error
         );
         assert_eq!(net_builder.net_devices.len(), 1);
@@ -292,11 +333,7 @@ mod tests {
         // Error Case: Add new network config with the same dev_host_name as netif_1.
         let netif_2 = create_netif(id_2, host_dev_name_1, guest_mac_2);
         assert_eq!(
-            net_builder
-                .build(netif_2.clone())
-                .err()
-                .unwrap()
-                .to_string(),
+            net_builder.build(netif_2).err().unwrap().to_string(),
             NetworkInterfaceError::CreateNetworkDevice(devices::virtio::net::Error::TapOpen(
                 TapError::CreateTap(std::io::Error::from_raw_os_error(16))
             ))
@@ -306,7 +343,7 @@ mod tests {
 
         // Adding the second valid network config.
         let netif_2 = create_netif(id_2, host_dev_name_2, guest_mac_2);
-        assert!(net_builder.build(netif_2.clone()).is_ok());
+        assert!(net_builder.build(netif_2).is_ok());
 
         // Error Cases for UPDATE
         // Error Case: Update netif_2 mac using the same mac as netif_1.
@@ -316,22 +353,14 @@ mod tests {
             guest_mac_1.to_string()
         );
         assert_eq!(
-            net_builder
-                .build(netif_2.clone())
-                .err()
-                .unwrap()
-                .to_string(),
+            net_builder.build(netif_2).err().unwrap().to_string(),
             expected_error
         );
 
         // Error Case: Update netif_2 dev_host_name using the same dev_host_name as netif_1.
         let netif_2 = create_netif(id_2, host_dev_name_1, guest_mac_2);
         assert_eq!(
-            net_builder
-                .build(netif_2.clone())
-                .err()
-                .unwrap()
-                .to_string(),
+            net_builder.build(netif_2).err().unwrap().to_string(),
             NetworkInterfaceError::CreateNetworkDevice(devices::virtio::net::Error::TapOpen(
                 TapError::CreateTap(std::io::Error::from_raw_os_error(16))
             ))
