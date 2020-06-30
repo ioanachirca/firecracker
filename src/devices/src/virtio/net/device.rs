@@ -369,7 +369,7 @@ impl Net {
             }
             Err(e) => {
                 error!("Failed to write to tap: {:?}", e);
-                METRICS.net.tx_fails.inc();
+                METRICS.net.tap_write_fails.inc();
             }
         };
         false
@@ -523,9 +523,11 @@ impl Net {
                     }
                     Err(e) => {
                         error!("Failed to read slice: {:?}", e);
-                        METRICS.net.tx_fails.inc();
                         if let GuestMemoryError::PartialBuffer { completed, .. } = e {
                             read_count += completed;
+                            METRICS.net.tx_partial_reads.inc();
+                        } else {
+                            METRICS.net.tx_fails.inc();
                         }
                         break;
                     }
